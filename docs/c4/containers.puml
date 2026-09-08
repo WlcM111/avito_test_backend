@@ -1,0 +1,40 @@
+@startuml containers
+title Авито.Кухня — C4 Level 2 (Containers)
+
+skinparam componentStyle rectangle
+skinparam defaultTextAlignment center
+
+actor "Покупатель\n(web-клиент)" as customer
+component "partner-pos\nGo\nэмулятор кассы заведения" as pos
+
+package "Платформа Авито.Кухня" {
+  component "merchant-service\nGo · HTTP :8081 · gRPC :9090\nзаведения, ключи доступа,\nкоммерческий профиль\n[РЕАЛИЗОВАН]" as merchant
+  component "catalog-service\nGo · HTTP :8082 · gRPC :9090\nменю: структура, названия, цены" as catalog
+  component "inventory-service\nGo · HTTP :8083 · gRPC :9090\nпоштучный учёт, резервы,\nжурнал движений" as inventory
+  component "order-service\nGo · HTTP :8084\nзаказы, жизненный цикл,\nидемпотентность, outbox" as order
+}
+
+database "PostgreSQL 18\nБД merchant / catalog /\ninventory / orders\n(своя роль на каждую)" as db
+
+customer --> merchant : HTTP/JSON
+customer --> catalog  : HTTP/JSON
+customer --> inventory : HTTP/JSON
+customer --> order    : HTTP/JSON
+
+pos --> merchant  : HTTP/JSON + X-Api-Key
+pos --> catalog   : HTTP/JSON + X-Api-Key
+pos --> inventory : HTTP/JSON + X-Api-Key
+pos --> order     : HTTP/JSON + X-Api-Key
+
+catalog   --> merchant : gRPC AuthenticateApiKey
+inventory --> merchant : gRPC AuthenticateApiKey
+order     --> merchant : gRPC AuthenticateApiKey,\nGetMerchant
+order     --> catalog  : gRPC QuoteItems
+order     --> inventory : gRPC Reserve,\nCommitReservation,\nReleaseReservation
+
+merchant  --> db : pg wire (db merchant)
+catalog   --> db : pg wire (db catalog)
+inventory --> db : pg wire (db inventory)
+order     --> db : pg wire (db orders)
+
+@enduml

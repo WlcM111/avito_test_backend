@@ -1,0 +1,36 @@
+@startuml merchant_cjm
+title CJM заведения — Авито.Кухня
+
+start
+:Оператор площадки подключил заведение\n(закрытый список, выдан X-Api-Key);
+:S-M1 Настроить профиль\nPATCH /api/v1/merchant/profile\nIf-Match: version;
+:S-M2 Опубликовать меню снимком\nPUT /api/v1/merchant/menu\nIf-Match: menu_version;
+note right
+  Публикация меню НЕ создаёт остатков:
+  карточка появляется с on_hand_qty = 0
+end note
+:S-M3 Установить остаток в штуках\nPUT /api/v1/merchant/stock/{id};
+:S-M5 Управлять стоп-листом\nPATCH /api/v1/merchant/stock/{id};
+note right
+  Перевод в ENABLED не меняет
+  ни on_hand_qty, ни reserved_qty
+end note
+:Включить приём заказов\nPATCH /api/v1/merchant/profile;
+repeat
+  :S-M6 Опросить очередь\nGET /api/v1/merchant/orders?status=CREATED;
+  if (Есть новый заказ?) then (да)
+    if (Можем приготовить?) then (да)
+      :S-M7 Подтвердить\nPOST .../accept {eta_minutes};
+      :Штуки списываются (Commit);
+      :S-M8 COOKING → DELIVERING → DELIVERED;
+    else (нет)
+      :S-M7 Отклонить\nPOST .../reject {reason};
+      :Штуки возвращаются (Release);
+    endif
+  else (нет)
+    :Пауза 5 секунд;
+  endif
+  :S-M4 При поступлении товара\nPOST .../stock/{id}/adjust\noperation_key;
+repeat while (смена продолжается)
+stop
+@enduml

@@ -1,0 +1,220 @@
+openapi: 3.0.3
+info:
+  title: Avito.Kitchen — merchant-service external API
+  version: "1.0.0"
+  description: |
+    External HTTP contract of merchant-service. It has two audiences:
+      * customer endpoints under /api/v1/merchants — public, no authentication
+        (customer authentication is out of scope for the MVP);
+      * merchant endpoints under /api/v1/merchant — authenticated with the
+        access key of the outlet.
+    All monetary amounts are integers in RUB minor units (kopecks).
+servers:
+  - url: http://localhost:8081
+    description: Local development (docker compose)
+tags:
+  - name: customer
+  - name: merchant
+
+paths:
+  /api/v1/merchants:
+    get:
+      tags: [customer]
+      summary: List the connected outlets
+      description: Returns active outlets only. Suspended outlets are not public.
+      parameters:
+        - { name: city, in: query, schema: { type: string, maxLength: 100 } }
+        - { name: q, in: query, schema: { type: string, maxLength: 100 },
+            description: Case-insensitive substring of the name or the cuisine }
+        - { name: only_accepting, in: query, schema: { type: boolean } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+        - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+      responses:
+        "200":
+          description: One page of outlets
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MerchantPage" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/merchants/{merchant_id}:
+    get:
+      tags: [customer]
+      summary: Get one outlet
+      parameters:
+        - { name: merchant_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The outlet
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Merchant" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/merchant/profile:
+    get:
+      tags: [merchant]
+      summary: Read the own profile
+      security: [{ apiKey: [] }]
+      responses:
+        "200":
+          description: The profile of the authenticated outlet
+          headers:
+            ETag:
+              description: Current profile version, to be sent back in If-Match
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Merchant" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    patch:
+      tags: [merchant]
+      summary: Update the own commercial profile
+      description: |
+        Partial update: only the fields present in the body are changed.
+        If-Match enables optimistic concurrency control. When it is present and
+        does not match the stored version the request is rejected with 412
+        instead of overwriting a concurrent change.
+      security: [{ apiKey: [] }]
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          schema: { type: string }
+          description: Profile version, optionally quoted, as returned in ETag
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProfilePatch" }
+      responses:
+        "200":
+          description: The updated profile
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Merchant" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "412": { $ref: "#/components/responses/VersionConflict" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+
+  schemas:
+    Merchant:
+      type: object
+      required:
+        [id, slug, name, description, cuisine, city, address, phone, status,
+         is_accepting_orders, can_accept_orders, min_order_minor,
+         delivery_fee_minor, avg_prep_minutes, currency, version,
+         created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string }
+        name: { type: string, maxLength: 200 }
+        description: { type: string }
+        cuisine: { type: string }
+        city: { type: string, maxLength: 100 }
+        address: { type: string, maxLength: 500 }
+        phone: { type: string }
+        status:
+          type: string
+          enum: [ACTIVE, SUSPENDED]
+          description: Platform membership, changed by the operator only
+        is_accepting_orders:
+          type: boolean
+          description: Operational switch owned by the outlet
+        can_accept_orders:
+          type: boolean
+          description: status is ACTIVE and is_accepting_orders is true
+        min_order_minor: { type: integer, format: int64, minimum: 0, maximum: 10000000 }
+        delivery_fee_minor: { type: integer, format: int64, minimum: 0, maximum: 1000000 }
+        avg_prep_minutes: { type: integer, format: int32, minimum: 1, maximum: 240 }
+        currency: { type: string, enum: [RUB] }
+        version: { type: integer, format: int64, minimum: 1 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    MerchantPage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Merchant" }
+        total: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 50 }
+        offset: { type: integer, minimum: 0 }
+
+    ProfilePatch:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        is_accepting_orders: { type: boolean }
+        min_order_minor: { type: integer, format: int64, minimum: 0, maximum: 10000000 }
+        delivery_fee_minor: { type: integer, format: int64, minimum: 0, maximum: 1000000 }
+        avg_prep_minutes: { type: integer, format: int32, minimum: 1, maximum: 240 }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable machine-readable code
+              example: VALIDATION_FAILED
+            message: { type: string }
+            request_id: { type: string }
+            details:
+              type: array
+              items:
+                type: object
+                required: [field, reason]
+                properties:
+                  field: { type: string }
+                  reason: { type: string }
+
+  responses:
+    BadRequest:
+      description: Malformed request (VALIDATION_FAILED)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unauthorized:
+      description: Missing, unknown or revoked access key (UNAUTHORIZED)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    NotFound:
+      description: Outlet not found (MERCHANT_NOT_FOUND)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    VersionConflict:
+      description: Stale If-Match (VERSION_CONFLICT)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    PayloadTooLarge:
+      description: Body above the configured limit (PAYLOAD_TOO_LARGE)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    UnsupportedMediaType:
+      description: Content-Type is not application/json (UNSUPPORTED_MEDIA_TYPE)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    ValidationFailed:
+      description: Input failed validation (VALIDATION_FAILED, NO_PROFILE_CHANGES)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    InternalError:
+      description: Unexpected failure (INTERNAL_ERROR)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }

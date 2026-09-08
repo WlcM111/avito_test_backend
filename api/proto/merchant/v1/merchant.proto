@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package merchant.v1;
+
+option go_package = "github.com/avito-kitchen/platform/gen/grpc/merchant/v1;merchantv1";
+
+// MerchantService is the internal contract of merchant-service: the single
+// source of truth for merchant identity, access keys and commercial profile.
+// Consumers: catalog-service, inventory-service, order-service.
+service MerchantService {
+  // AuthenticateApiKey resolves a merchant access key to a merchant id.
+  // NOT_FOUND when the key is unknown or revoked.
+  rpc AuthenticateApiKey(AuthenticateApiKeyRequest) returns (AuthenticateApiKeyResponse);
+  // GetMerchant returns the commercial profile of one merchant.
+  // NOT_FOUND when the merchant does not exist.
+  rpc GetMerchant(GetMerchantRequest) returns (GetMerchantResponse);
+  // GetMerchants returns profiles for a batch of ids; unknown ids are omitted.
+  rpc GetMerchants(GetMerchantsRequest) returns (GetMerchantsResponse);
+}
+
+enum MerchantStatus {
+  MERCHANT_STATUS_UNSPECIFIED = 0;
+  MERCHANT_STATUS_ACTIVE = 1;
+  MERCHANT_STATUS_SUSPENDED = 2;
+}
+
+message Merchant {
+  string id = 1;
+  string slug = 2;
+  string name = 3;
+  string city = 4;
+  string address = 5;
+  MerchantStatus status = 6;
+  bool is_accepting_orders = 7;
+  int64 min_order_minor = 8;
+  int64 delivery_fee_minor = 9;
+  int32 avg_prep_minutes = 10;
+  int64 version = 11;
+}
+
+message AuthenticateApiKeyRequest { string api_key = 1; }
+message AuthenticateApiKeyResponse {
+  string merchant_id = 1;
+  MerchantStatus status = 2;
+}
+message GetMerchantRequest { string merchant_id = 1; }
+message GetMerchantResponse { Merchant merchant = 1; }
+message GetMerchantsRequest { repeated string merchant_ids = 1; }
+message GetMerchantsResponse { repeated Merchant merchants = 1; }

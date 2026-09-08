@@ -1,0 +1,356 @@
+openapi: 3.0.3
+info:
+  title: Avito.Kitchen — catalog-service external API
+  version: "1.0.0"
+  description: |
+    External HTTP contract of catalog-service, the single source of truth for
+    menu structure, item identity and prices.
+
+    The catalogue owns *what* is sold and *for how much*. It owns no quantity:
+    how many units exist belongs to inventory-service, and publishing a menu
+    neither creates nor confirms stock. A client that needs to know whether a
+    position can actually be ordered combines this menu with
+    `GET /api/v1/merchants/{merchant_id}/availability` of inventory-service.
+
+    Identity: `menu_item_id` is the platform identifier of a position — the id
+    inventory-service keeps a stock card for and an order references.
+    `external_id` is the identifier of the same position in the merchant's own
+    system. A publication is matched by `external_id`, which is what keeps
+    `menu_item_id` stable across publications; positions absent from a
+    published snapshot are withdrawn from sale, never deleted.
+
+    Money is expressed in whole minor units (kopecks) of RUB.
+
+    Two audiences:
+      * the customer endpoint under /api/v1/merchants/{merchant_id}/menu is
+        public, because customer authentication is out of scope for the MVP;
+      * the merchant endpoints under /api/v1/merchant are authenticated with
+        the access key of the outlet, which is resolved through
+        merchant-service.
+
+    Optimistic concurrency: `ETag` carries the current `menu_version`, and
+    `If-Match` carries the version the change applies to. Zero is a valid
+    precondition and means "my menu has never been published".
+servers:
+  - url: http://localhost:8082
+    description: Local development (docker compose)
+tags:
+  - name: customer
+  - name: merchant
+
+paths:
+  /api/v1/merchants/{merchant_id}/menu:
+    get:
+      tags: [customer]
+      summary: Published menu of one merchant
+      description: >-
+        Returns the current menu with its version. A merchant that has never
+        published a menu is reported as 404: catalog-service does not own
+        merchant identity and answers only for the menus it holds.
+      parameters:
+        - { name: merchant_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The published menu
+          headers:
+            ETag:
+              description: Current menu version, to be sent back in If-Match
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Menu" }
+        "404": { $ref: "#/components/responses/MenuNotFound" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/merchant/menu:
+    get:
+      tags: [merchant]
+      summary: Read the own menu
+      description: >-
+        Unlike the public view this endpoint answers before the first
+        publication as well, with an empty menu at version 0.
+      security: [{ apiKey: [] }]
+      responses:
+        "200":
+          description: The own menu
+          headers:
+            ETag:
+              description: Current menu version
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Menu" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/DependencyUnavailable" }
+    put:
+      tags: [merchant]
+      summary: Publish the whole menu as one snapshot
+      description: >-
+        Replaces the menu with the snapshot. Positions present in it are
+        created or updated and matched by `external_id`; positions absent from
+        it are withdrawn from sale. Partial publication does not exist: a
+        merchant integration that lost an item during export must not keep
+        selling it silently.
+      security: [{ apiKey: [] }]
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          description: >-
+            Menu version this publication applies to. When present and
+            different from the stored version the request fails with 412.
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MenuSnapshot" }
+      responses:
+        "200":
+          description: The published menu and what the publication changed
+          headers:
+            ETag:
+              description: New menu version
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublishResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "412": { $ref: "#/components/responses/VersionConflict" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "503": { $ref: "#/components/responses/DependencyUnavailable" }
+
+  /api/v1/merchant/menu/items/{item_id}:
+    parameters:
+      - { name: item_id, in: path, required: true, schema: { type: string, format: uuid } }
+    patch:
+      tags: [merchant]
+      summary: Change the name or the price of one published item
+      description: >-
+        A partial change that avoids republishing the whole menu. It bumps the
+        menu version, because a price is menu content that order-service quotes
+        against. A withdrawn item cannot be changed.
+      security: [{ apiKey: [] }]
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          description: Menu version this change applies to
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MenuItemPatch" }
+      responses:
+        "200":
+          description: The changed item and the new menu version
+          headers:
+            ETag:
+              description: New menu version
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PatchedMenuItem" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/MenuItemNotFound" }
+        "412": { $ref: "#/components/responses/VersionConflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "503": { $ref: "#/components/responses/DependencyUnavailable" }
+
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+      description: Access key of the outlet, resolved through merchant-service.
+
+  schemas:
+    MenuItem:
+      type: object
+      required:
+        [menu_item_id, external_id, name, description, price_minor, currency, position, updated_at]
+      properties:
+        menu_item_id:
+          type: string
+          format: uuid
+          description: Platform identifier; stable across publications.
+        external_id:
+          type: string
+          maxLength: 64
+          description: Identifier of the same position in the merchant's system.
+        name: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 1000 }
+        price_minor:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 100000000
+          description: Price in whole minor units (kopecks).
+        currency: { type: string, enum: [RUB] }
+        position: { type: integer, format: int32, minimum: 0 }
+        updated_at: { type: string, format: date-time }
+
+    MenuCategory:
+      type: object
+      required: [name, position, items]
+      properties:
+        name: { type: string, maxLength: 100 }
+        position: { type: integer, format: int32, minimum: 0 }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/MenuItem" }
+
+    Menu:
+      type: object
+      required: [merchant_id, menu_version, currency, categories]
+      properties:
+        merchant_id: { type: string, format: uuid }
+        menu_version:
+          type: integer
+          format: int64
+          minimum: 0
+          description: 0 means the merchant has never published a menu.
+        currency: { type: string, enum: [RUB] }
+        categories:
+          type: array
+          items: { $ref: "#/components/schemas/MenuCategory" }
+
+    SnapshotItem:
+      type: object
+      required: [external_id, name, price_minor]
+      properties:
+        external_id: { type: string, minLength: 1, maxLength: 64 }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        description: { type: string, maxLength: 1000 }
+        price_minor: { type: integer, format: int64, minimum: 1, maximum: 100000000 }
+        position: { type: integer, format: int32, minimum: 0, default: 0 }
+
+    SnapshotCategory:
+      type: object
+      required: [name, items]
+      description: >-
+        A category is read through the items that reference it, so a published
+        category must contain at least one item.
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        position: { type: integer, format: int32, minimum: 0, default: 0 }
+        items:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/SnapshotItem" }
+
+    MenuSnapshot:
+      type: object
+      required: [categories]
+      properties:
+        categories:
+          type: array
+          minItems: 1
+          maxItems: 50
+          description: At most 500 items in total; external_id must be unique.
+          items: { $ref: "#/components/schemas/SnapshotCategory" }
+
+    PublishResult:
+      allOf:
+        - $ref: "#/components/schemas/Menu"
+        - type: object
+          required: [created, updated, withdrawn]
+          properties:
+            created: { type: integer, description: Items the publication added to the menu. }
+            updated: { type: integer, description: Items the publication changed. }
+            withdrawn: { type: integer, description: Items the publication removed from sale. }
+
+    MenuItemPatch:
+      type: object
+      minProperties: 1
+      description: At least one field must be present.
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        price_minor: { type: integer, format: int64, minimum: 1, maximum: 100000000 }
+
+    PatchedMenuItem:
+      allOf:
+        - $ref: "#/components/schemas/MenuItem"
+        - type: object
+          required: [menu_version]
+          properties:
+            menu_version: { type: integer, format: int64 }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            request_id: { type: string }
+            details:
+              type: array
+              items:
+                type: object
+                required: [field, reason]
+                properties:
+                  field: { type: string }
+                  reason: { type: string }
+
+  responses:
+    BadRequest:
+      description: The body is not valid JSON or contains unknown fields
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: The access key is missing, unknown or revoked
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    MenuNotFound:
+      description: The merchant has not published a menu (code MENU_NOT_FOUND)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    MenuItemNotFound:
+      description: No published item with this identifier (code MENU_ITEM_NOT_FOUND)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    VersionConflict:
+      description: If-Match does not match the stored menu version (code VERSION_CONFLICT)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    PayloadTooLarge:
+      description: The snapshot exceeds the configured body limit
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    UnsupportedMediaType:
+      description: Content-Type is not application/json
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationFailed:
+      description: The request failed validation (code VALIDATION_FAILED)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    DependencyUnavailable:
+      description: merchant-service could not be reached (code DEPENDENCY_UNAVAILABLE)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    InternalError:
+      description: Internal error (code INTERNAL_ERROR)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }

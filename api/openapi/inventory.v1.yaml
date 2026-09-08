@@ -1,0 +1,397 @@
+openapi: 3.0.3
+info:
+  title: Avito.Kitchen — inventory-service external API
+  version: "1.0.0"
+  description: |
+    External HTTP contract of inventory-service, the single source of truth for
+    the per-unit availability of menu items.
+
+    Accounting model: the unit of accounting is one sellable unit of a menu item
+    at a merchant. Units are fungible and counted; an individual unit is not
+    identified. The accounting object is the stock card, addressed by
+    (merchant, menu item). A card carries two independent dimensions:
+      * sales_state - the merchant's stop-list switch;
+      * quantities  - on_hand_qty and reserved_qty, in whole units.
+    Enabling sales never confirms any quantity: a card may be ENABLED with zero
+    units and is then not sellable.
+
+    Two audiences:
+      * the customer endpoint under /api/v1/merchants/{merchant_id}/availability
+        is public, because customer authentication is out of scope for the MVP;
+      * the merchant endpoints under /api/v1/merchant are authenticated with the
+        access key of the outlet, which is resolved through merchant-service.
+servers:
+  - url: http://localhost:8083
+    description: Local development (docker compose)
+tags:
+  - name: customer
+  - name: merchant
+
+paths:
+  /api/v1/merchants/{merchant_id}/availability:
+    get:
+      tags: [customer]
+      summary: Per-unit availability of menu items
+      parameters:
+        - { name: merchant_id, in: path, required: true, schema: { type: string, format: uuid } }
+        - name: menu_item_ids
+          in: query
+          required: true
+          description: >-
+            Menu item identifiers, repeated or comma separated.
+            At most 100 distinct identifiers per request.
+          schema:
+            type: array
+            items: { type: string, format: uuid }
+          style: form
+          explode: true
+      responses:
+        "200":
+          description: Availability of every requested item
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Availability" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/merchant/stock:
+    get:
+      tags: [merchant]
+      summary: List the own stock cards
+      security: [{ apiKey: [] }]
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+        - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+      responses:
+        "200":
+          description: One page of stock cards
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StockPage" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "503": { $ref: "#/components/responses/DependencyUnavailable" }
+
+  /api/v1/merchant/stock/{menu_item_id}:
+    parameters:
+      - { name: menu_item_id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [merchant]
+      summary: Read one stock card
+      security: [{ apiKey: [] }]
+      responses:
+        "200":
+          description: The stock card
+          headers:
+            ETag:
+              description: Current card version, to be sent back in If-Match
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StockItem" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/StockItemNotFound" }
+        "503": { $ref: "#/components/responses/DependencyUnavailable" }
+    put:
+      tags: [merchant]
+      summary: Set the absolute number of units on hand
+      description: |
+        Creates the card when it does not exist yet. The request is refused with
+        409 BELOW_RESERVED when the value is lower than the units currently held
+        for orders: silently dropping held units is not allowed.
+        If-Match enables optimistic concurrency control.
+      security: [{ apiKey: [] }]
+      parameters:
+        - { name: If-Match, in: header, required: false, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SetOnHand" }
+      responses:
+        "200":
+          description: The updated card
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StockItem" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/StockConflict" }
+        "412": { $ref: "#/components/responses/VersionConflict" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "503": { $ref: "#/components/responses/DependencyUnavailable" }
+    patch:
+      tags: [merchant]
+      summary: Set the stop-list switch
+      description: |
+        Changes only sales_state. It never changes a quantity: enabling sales
+        does not confirm any units. Creates the card with zero units when it
+        does not exist yet.
+      security: [{ apiKey: [] }]
+      parameters:
+        - { name: If-Match, in: header, required: false, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SetSalesState" }
+      responses:
+        "200":
+          description: The updated card
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StockItem" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "412": { $ref: "#/components/responses/VersionConflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "503": { $ref: "#/components/responses/DependencyUnavailable" }
+
+  /api/v1/merchant/stock/{menu_item_id}/adjust:
+    post:
+      tags: [merchant]
+      summary: Apply a relative change to the units on hand
+      description: |
+        A relative change is not idempotent by nature, so operation_key is
+        required: repeating a request with the same key returns the stored
+        result and applies the delta once.
+      security: [{ apiKey: [] }]
+      parameters:
+        - { name: menu_item_id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AdjustOnHand" }
+      responses:
+        "200":
+          description: The updated card; duplicate reports a deduplicated repeat
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdjustResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/StockConflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "503": { $ref: "#/components/responses/DependencyUnavailable" }
+
+  /api/v1/merchant/stock/{menu_item_id}/movements:
+    get:
+      tags: [merchant]
+      summary: Journal of quantity changes of one card
+      description: Append-only history, newest entries first.
+      security: [{ apiKey: [] }]
+      parameters:
+        - { name: menu_item_id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+        - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+      responses:
+        "200":
+          description: One page of the journal
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MovementPage" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/StockItemNotFound" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "503": { $ref: "#/components/responses/DependencyUnavailable" }
+
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+
+  schemas:
+    StockItem:
+      type: object
+      required: [menu_item_id, sales_state, on_hand_qty, reserved_qty,
+                 available_qty, sellable, version, updated_at]
+      properties:
+        menu_item_id: { type: string, format: uuid }
+        sales_state:
+          type: string
+          enum: [ENABLED, STOPPED]
+          description: Stop-list switch, independent of the quantities
+        on_hand_qty:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 1000000
+          description: Units physically available for sale
+        reserved_qty:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Units held for unconfirmed orders
+        available_qty:
+          type: integer
+          format: int32
+          description: on_hand_qty minus reserved_qty
+        sellable:
+          type: boolean
+          description: sales_state is ENABLED and available_qty is above zero
+        version: { type: integer, format: int64, minimum: 1 }
+        updated_at: { type: string, format: date-time }
+
+    StockPage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/StockItem" }
+        total: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 50 }
+        offset: { type: integer, minimum: 0 }
+
+    Availability:
+      type: object
+      required: [merchant_id, items]
+      properties:
+        merchant_id: { type: string, format: uuid }
+        items:
+          type: array
+          items:
+            type: object
+            required: [menu_item_id, tracked, sales_state, available_qty, sellable]
+            properties:
+              menu_item_id: { type: string, format: uuid }
+              tracked:
+                type: boolean
+                description: >-
+                  False when the merchant keeps no card for this item, which is
+                  different from a card holding zero units.
+              sales_state: { type: string, enum: [ENABLED, STOPPED] }
+              available_qty: { type: integer, format: int32 }
+              sellable: { type: boolean }
+
+    SetOnHand:
+      type: object
+      required: [on_hand_qty]
+      additionalProperties: false
+      properties:
+        on_hand_qty: { type: integer, format: int32, minimum: 0, maximum: 1000000 }
+        reason: { type: string, maxLength: 200 }
+
+    AdjustOnHand:
+      type: object
+      required: [delta, operation_key]
+      additionalProperties: false
+      properties:
+        delta:
+          type: integer
+          format: int32
+          description: Non-zero relative change, positive or negative
+        operation_key:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Deduplication key; a repeat with the same key changes nothing
+        reason: { type: string, maxLength: 200 }
+
+    AdjustResult:
+      allOf:
+        - $ref: "#/components/schemas/StockItem"
+        - type: object
+          required: [duplicate]
+          properties:
+            duplicate:
+              type: boolean
+              description: True when the request repeated an already applied operation_key
+
+    SetSalesState:
+      type: object
+      required: [sales_state]
+      additionalProperties: false
+      properties:
+        sales_state: { type: string, enum: [ENABLED, STOPPED] }
+
+    MovementPage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [id, menu_item_id, kind, delta_on_hand, delta_reserved,
+                       on_hand_after, reserved_after, created_at]
+            properties:
+              id: { type: integer, format: int64 }
+              menu_item_id: { type: string, format: uuid }
+              kind:
+                type: string
+                enum: [SET, ADJUST, RESERVE, RELEASE, COMMIT, EXPIRE]
+              delta_on_hand: { type: integer, format: int32 }
+              delta_reserved: { type: integer, format: int32 }
+              on_hand_after: { type: integer, format: int32 }
+              reserved_after: { type: integer, format: int32 }
+              reservation_id: { type: string, format: uuid }
+              operation_key: { type: string }
+              reason: { type: string }
+              created_at: { type: string, format: date-time }
+        total: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 50 }
+        offset: { type: integer, minimum: 0 }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: BELOW_RESERVED }
+            message: { type: string }
+            request_id: { type: string }
+            details:
+              type: array
+              items:
+                type: object
+                required: [field, reason]
+                properties:
+                  field: { type: string }
+                  reason: { type: string }
+
+  responses:
+    BadRequest:
+      description: Malformed request (VALIDATION_FAILED)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unauthorized:
+      description: Missing, unknown or revoked access key (UNAUTHORIZED)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    StockItemNotFound:
+      description: The merchant keeps no card for this menu item (STOCK_ITEM_NOT_FOUND)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    StockConflict:
+      description: BELOW_RESERVED or NEGATIVE_ON_HAND
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    VersionConflict:
+      description: Stale If-Match (VERSION_CONFLICT)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    PayloadTooLarge:
+      description: Body above the configured limit (PAYLOAD_TOO_LARGE)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    UnsupportedMediaType:
+      description: Content-Type is not application/json (UNSUPPORTED_MEDIA_TYPE)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    ValidationFailed:
+      description: Input failed validation (VALIDATION_FAILED)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    DependencyUnavailable:
+      description: merchant-service could not be reached (DEPENDENCY_UNAVAILABLE)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    InternalError:
+      description: Unexpected failure (INTERNAL_ERROR)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }

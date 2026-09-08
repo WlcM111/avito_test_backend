@@ -1,0 +1,41 @@
+@startuml customer_cjm
+title CJM покупателя — Авито.Кухня
+
+start
+:Открыл Авито.Кухня;
+:S-C1 Список заведений\nGET /api/v1/merchants;
+:S-C2 Меню заведения\nGET .../menu + доступность в штуках;
+note right
+  Позиция заказуема, только если
+  sales_state = ENABLED И available_qty > 0
+end note
+:Собрал корзину\n(состояние на стороне клиента);
+repeat
+  :S-C3 Предпросмотр\nPOST /api/v1/orders/preview;
+  if (Есть проблемы?) then (да)
+    :Показать причину по каждой позиции:\nстоп-лист, не хватает штук,\nзаведение не принимает заказы,\nсумма ниже минимальной;
+    :Скорректировать корзину;
+  else (нет)
+    break
+  endif
+repeat while (повторить)
+:S-C4 Оформление\nPOST /api/v1/orders\nIdempotency-Key;
+if (Штуки удержаны?) then (нет)
+  :409 INSUFFICIENT_UNITS\nс фактическим остатком;
+  stop
+else (да)
+  :Заказ CREATED,\nштуки удержаны (HELD);
+endif
+fork
+  :S-C5 Отслеживание статуса\nGET /api/v1/orders/{id};
+fork again
+  :S-C6 Отмена до подтверждения\nPOST .../cancel → Release;
+end fork
+if (Решение заведения) then (принял)
+  :CONFIRMED → COOKING →\nDELIVERING → DELIVERED\n(штуки списаны, Commit);
+else (отклонил / отменено)
+  :REJECTED / CANCELLED\n(штуки возвращены, Release);
+endif
+:S-C7 История заказов\nGET /api/v1/orders;
+stop
+@enduml

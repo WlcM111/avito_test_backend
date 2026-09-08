@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package catalog.v1;
+
+option go_package = "github.com/avito-kitchen/platform/gen/grpc/catalog/v1;catalogv1";
+
+// CatalogService is the internal contract of catalog-service: the single
+// source of truth for menu structure, item identity and prices.
+// It owns *what* is sold and *for how much*; it does not own quantities.
+// Consumers: order-service.
+service CatalogService {
+  // QuoteItems resolves menu item ids to their current names and prices.
+  // Items that do not exist, are deleted or belong to another merchant are
+  // returned with the corresponding problem code instead of failing the call.
+  rpc QuoteItems(QuoteItemsRequest) returns (QuoteItemsResponse);
+}
+
+enum ItemProblem {
+  ITEM_PROBLEM_UNSPECIFIED = 0;
+  ITEM_PROBLEM_NONE = 1;
+  ITEM_PROBLEM_NOT_FOUND = 2;
+  ITEM_PROBLEM_NOT_IN_MERCHANT = 3;
+  ITEM_PROBLEM_UNPUBLISHED = 4;
+}
+
+message QuoteItemsRequest {
+  string merchant_id = 1;
+  repeated string menu_item_ids = 2;
+}
+
+message QuotedItem {
+  string menu_item_id = 1;
+  string external_id = 2;
+  string name = 3;
+  int64 unit_price_minor = 4;
+  ItemProblem problem = 5;
+}
+
+message QuoteItemsResponse {
+  int64 menu_version = 1;
+  repeated QuotedItem items = 2;
+}

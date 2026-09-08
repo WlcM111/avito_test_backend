@@ -1,0 +1,267 @@
+openapi: 3.0.3
+info:
+  title: Avito.Kitchen — partner-pos control API
+  version: "1.0.0"
+  description: |
+    Control API of the demonstration till of one outlet (requirement A-06).
+
+    partner-pos models an EXTERNAL organisation (TZ v3.0 §3.3). It owns no
+    platform data, has no database and no access to the internal gRPC network.
+    Everything it does towards the platform goes through the public HTTP APIs
+    with the access key of the outlet:
+
+      * `PUT /api/v1/merchant/menu` of catalog-service — publishes the till menu;
+      * `PUT/PATCH /api/v1/merchant/stock/{menu_item_id}` of inventory-service —
+        keeps the quantities and the stop list in step with the till;
+      * `GET /api/v1/merchant/orders` and the decision endpoints of
+        order-service — answers the queue every five seconds (scenario S-M6).
+
+    This API exists only to steer the demonstration: read and change the till
+    menu, publish it, look at the queue and switch how the till answers orders.
+    It is unauthenticated because it exposes no platform data and runs beside
+    the platform in the same compose stack; the access key of the outlet never
+    leaves the process.
+
+    Money is expressed in whole minor units (kopecks) of RUB.
+servers:
+  - url: http://localhost:8085
+    description: Local development (docker compose)
+
+paths:
+  /pos/menu:
+    get:
+      summary: Menu the till keeps
+      description: >-
+        Returns the till menu together with what the platform knows about it.
+        `menu_item_id` is empty until the menu has been published.
+      responses:
+        "200":
+          description: The till menu
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Menu" }
+
+  /pos/menu/{external_id}:
+    patch:
+      summary: Change one position of the till menu
+      description: >-
+        Changes the till only. The change reaches the platform with the next
+        publication (price, name) and the next stock synchronisation (quantity,
+        stop list), exactly as a real till behaves.
+      parameters:
+        - name: external_id
+          in: path
+          required: true
+          description: Identifier of the position in the outlet's own system.
+          schema: { type: string, maxLength: 64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ItemPatch" }
+      responses:
+        "200":
+          description: The changed position
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Item" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/ItemNotFound" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+  /pos/publish:
+    post:
+      summary: Publish the till menu and push the quantities
+      description: >-
+        Sends the menu to catalog-service with `If-Match` on the current menu
+        version, reads it back to learn the platform identifiers, and then
+        pushes the quantities and the stop list to inventory-service. Both
+        halves are needed: publishing a menu never creates stock.
+      responses:
+        "200":
+          description: What the publication did
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublishResult" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "503": { $ref: "#/components/responses/PlatformUnavailable" }
+
+  /pos/orders:
+    get:
+      summary: Orders of the outlet the till is watching
+      description: >-
+        A live read of the merchant queue of order-service, limited to the
+        statuses the till can still act on. The till stores no orders itself.
+      responses:
+        "200":
+          description: The queue
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Orders" }
+        "503": { $ref: "#/components/responses/PlatformUnavailable" }
+
+  /pos/behavior:
+    put:
+      summary: Switch how the till answers orders
+      description: >-
+        `AUTO_ACCEPT` confirms every new order, `AUTO_REJECT` refuses it with
+        the given reason, `MANUAL` leaves it for a person. With `kitchen` on,
+        an accepted order is walked through COOKING, DELIVERING and DELIVERED,
+        one step per configured interval.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Behavior" }
+      responses:
+        "200":
+          description: The behaviour in force
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Behavior" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+components:
+  schemas:
+    Item:
+      type: object
+      required: [external_id, name, description, category, price_minor, position, on_hand_qty, sales_stopped]
+      properties:
+        external_id: { type: string, maxLength: 64 }
+        menu_item_id:
+          type: string
+          format: uuid
+          description: Platform identifier; absent until the menu is published.
+        name: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 1000 }
+        category: { type: string, maxLength: 100 }
+        price_minor: { type: integer, format: int64, minimum: 1, maximum: 100000000 }
+        position: { type: integer, format: int32, minimum: 0 }
+        on_hand_qty: { type: integer, format: int32, minimum: 0, maximum: 100000 }
+        sales_stopped: { type: boolean }
+
+    Menu:
+      type: object
+      required: [published, menu_version, currency, items]
+      properties:
+        published: { type: boolean }
+        menu_version: { type: integer, format: int64 }
+        currency: { type: string, enum: [RUB] }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Item" }
+
+    ItemPatch:
+      type: object
+      minProperties: 1
+      description: At least one field must be present.
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        description: { type: string, maxLength: 1000 }
+        price_minor: { type: integer, format: int64, minimum: 1, maximum: 100000000 }
+        on_hand_qty: { type: integer, format: int32, minimum: 0, maximum: 100000 }
+        sales_stopped: { type: boolean }
+
+    PublishResult:
+      type: object
+      required: [menu_version, items, matched]
+      properties:
+        menu_version: { type: integer, format: int64 }
+        items: { type: integer, description: Positions in the till menu. }
+        matched:
+          type: integer
+          description: Positions that now carry a platform identifier.
+
+    OrderItem:
+      type: object
+      required: [menu_item_id, external_id, name, qty]
+      properties:
+        menu_item_id: { type: string, format: uuid }
+        external_id: { type: string }
+        name: { type: string }
+        qty: { type: integer, format: int32 }
+
+    Order:
+      type: object
+      required: [order_id, status, total_minor, eta_minutes, updated_at, items]
+      properties:
+        order_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [CREATED, CONFIRMED, COOKING, DELIVERING]
+        total_minor: { type: integer, format: int64 }
+        eta_minutes: { type: integer, format: int32 }
+        updated_at: { type: string, format: date-time }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/OrderItem" }
+
+    Orders:
+      type: object
+      required: [items, total]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Order" }
+        total: { type: integer }
+
+    Behavior:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [AUTO_ACCEPT, AUTO_REJECT, MANUAL]
+        eta_minutes: { type: integer, format: int32, minimum: 0, maximum: 240 }
+        reject_reason:
+          type: string
+          maxLength: 200
+          description: Required in AUTO_REJECT mode.
+        kitchen:
+          type: boolean
+          description: Simulate preparation after a confirmation.
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            request_id: { type: string }
+            details:
+              type: array
+              items:
+                type: object
+                required: [field, reason]
+                properties:
+                  field: { type: string }
+                  reason: { type: string }
+
+  responses:
+    BadRequest:
+      description: The body is not valid JSON or contains unknown fields
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ItemNotFound:
+      description: The till has no such position (code POS_ITEM_NOT_FOUND)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationFailed:
+      description: The request failed validation (code VALIDATION_FAILED)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    PlatformUnavailable:
+      description: >-
+        catalog-service, inventory-service or order-service could not be
+        reached (code DEPENDENCY_UNAVAILABLE)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }

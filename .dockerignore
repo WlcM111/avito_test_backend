@@ -1,0 +1,10 @@
+.git
+.github
+docs
+test
+scripts
+*.md
+.env
+bin
+_variants
+_manifest

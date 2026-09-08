@@ -1,0 +1,606 @@
+openapi: 3.0.3
+info:
+  title: Avito.Kitchen — order-service external API
+  version: "1.0.0"
+  description: |
+    External HTTP contract of order-service, the owner of the order and its
+    lifecycle.
+
+    order-service owns no merchant, no menu and no units. It reads the
+    commercial profile from merchant-service, the names and prices from
+    catalog-service and the availability from inventory-service, and it stores
+    a snapshot of the names and prices with the order, so reading an order
+    never depends on those services.
+
+    Placement holds the units of the basket in inventory-service under a
+    reservation whose identifier is the order identifier. The terminal decision
+    of the merchant (accept, reject) and the cancellation of the customer are
+    recorded together with an outbox message in one transaction; a background
+    dispatcher then delivers the decision to inventory-service. Delivery is
+    at-least-once and the receiver is idempotent, so the units are consumed or
+    returned exactly once. **The stock therefore changes shortly after the
+    call, not during it.**
+
+    Money is expressed in whole minor units (kopecks) of RUB.
+
+    Two audiences:
+      * the customer endpoints under /api/v1/orders are public; the assignment
+        excludes customer authentication, so `X-Customer-Id` identifies the
+        client without authenticating it and only scopes an order to whoever
+        placed it;
+      * the merchant endpoints under /api/v1/merchant are authenticated with
+        the access key of the outlet, resolved through merchant-service.
+servers:
+  - url: http://localhost:8084
+    description: Local development (docker compose)
+tags:
+  - name: customer
+  - name: merchant
+
+paths:
+  /api/v1/orders/preview:
+    post:
+      tags: [customer]
+      summary: Recalculate a basket without placing it
+      description: >-
+        Reports the current prices, the availability of every position and the
+        problems of the basket as a whole. It creates nothing and holds
+        nothing, so it needs neither a customer identifier nor an idempotency
+        key. A basket with problems is still answered with 200: the client
+        needs the outcome of every position at once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PreviewRequest" }
+      responses:
+        "200":
+          description: The recalculated basket
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Preview" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/MerchantNotFound" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "503": { $ref: "#/components/responses/DependencyUnavailable" }
+
+  /api/v1/orders:
+    post:
+      tags: [customer]
+      summary: Place an order
+      description: >-
+        Holds the units of the basket and stores the order with a snapshot of
+        the names and prices. A repeat with the same `Idempotency-Key` returns
+        the order created the first time, again with 201 and with
+        `Idempotent-Replay: true`, because the client cannot tell the two calls
+        apart and must not be told the order failed.
+      parameters:
+        - $ref: "#/components/parameters/CustomerId"
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: Unique per customer; scopes the repeat of one placement.
+          schema: { type: string, minLength: 1, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateOrderRequest" }
+      responses:
+        "201":
+          description: The placed order, or the one created by an earlier repeat
+          headers:
+            Idempotent-Replay:
+              description: Present and true when the order already existed
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/MerchantNotFound" }
+        "409": { $ref: "#/components/responses/NotOrderable" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "503": { $ref: "#/components/responses/DependencyUnavailable" }
+    get:
+      tags: [customer]
+      summary: Order history of the customer
+      parameters:
+        - $ref: "#/components/parameters/CustomerId"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: One page of orders, newest first
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrderPage" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+  /api/v1/orders/{order_id}:
+    get:
+      tags: [customer]
+      summary: One order of the customer
+      description: >-
+        An order of another customer is reported as absent rather than as
+        forbidden: confirming that it exists would disclose it to anyone who
+        guesses an identifier.
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+        - $ref: "#/components/parameters/CustomerId"
+      responses:
+        "200":
+          description: The order
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "404": { $ref: "#/components/responses/OrderNotFound" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+  /api/v1/orders/{order_id}/cancel:
+    post:
+      tags: [customer]
+      summary: Cancel an order the merchant has not decided on
+      description: >-
+        Allowed only while the order is CREATED. The held units return
+        asynchronously through the outbox, so the answer describes the order,
+        not the stock. Cancelling an already cancelled order changes nothing
+        and is reported with `Idempotent-Replay: true`.
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+        - $ref: "#/components/parameters/CustomerId"
+      responses:
+        "200":
+          description: The cancelled order
+          headers:
+            Idempotent-Replay:
+              description: Present and true when the order was already cancelled
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "404": { $ref: "#/components/responses/OrderNotFound" }
+        "409": { $ref: "#/components/responses/StateConflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+  /api/v1/merchant/orders:
+    get:
+      tags: [merchant]
+      summary: Order queue of the outlet
+      description: Oldest first, so polling shows the orders in the order they arrived.
+      security: [{ apiKey: [] }]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: >-
+            Repeatable, or one comma-separated value. Absent means every status.
+          schema:
+            type: array
+            items: { $ref: "#/components/schemas/OrderStatus" }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: One page of orders, oldest first
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrderPage" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "503": { $ref: "#/components/responses/DependencyUnavailable" }
+
+  /api/v1/merchant/orders/{order_id}:
+    get:
+      tags: [merchant]
+      summary: One order of the outlet
+      security: [{ apiKey: [] }]
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      responses:
+        "200":
+          description: The order
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/OrderNotFound" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+  /api/v1/merchant/orders/{order_id}/accept:
+    post:
+      tags: [merchant]
+      summary: Accept an order
+      description: >-
+        Moves the order to CONFIRMED and schedules the consumption of the held
+        units. Repeating it changes nothing and is reported with
+        `Idempotent-Replay: true`, which is what makes the operation safe to
+        retry without an idempotency header.
+      security: [{ apiKey: [] }]
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AcceptRequest" }
+      responses:
+        "200":
+          description: The confirmed order
+          headers:
+            Idempotent-Replay:
+              description: Present and true when the order was already confirmed
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/OrderNotFound" }
+        "409": { $ref: "#/components/responses/StateConflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+  /api/v1/merchant/orders/{order_id}/reject:
+    post:
+      tags: [merchant]
+      summary: Refuse an order
+      description: >-
+        Moves the order to REJECTED and schedules the return of the held units.
+      security: [{ apiKey: [] }]
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RejectRequest" }
+      responses:
+        "200":
+          description: The refused order
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/OrderNotFound" }
+        "409": { $ref: "#/components/responses/StateConflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+  /api/v1/merchant/orders/{order_id}/status:
+    post:
+      tags: [merchant]
+      summary: Move a confirmed order along
+      description: >-
+        CONFIRMED → COOKING → DELIVERING → DELIVERED, one step at a time.
+        Accepting and refusing have their own endpoints because they carry an
+        estimate and a reason. These transitions change nothing outside
+        order-service.
+      security: [{ apiKey: [] }]
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StatusRequest" }
+      responses:
+        "200":
+          description: The moved order
+          headers:
+            Idempotent-Replay:
+              description: Present and true when the order was already in that status
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/OrderNotFound" }
+        "409": { $ref: "#/components/responses/StateConflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+      description: Access key of the outlet, resolved through merchant-service.
+
+  parameters:
+    OrderId:
+      name: order_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    CustomerId:
+      name: X-Customer-Id
+      in: header
+      required: true
+      description: >-
+        Identifies the customer. NOT a means of authentication: customer
+        authentication is out of scope for the MVP.
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+    Offset:
+      name: offset
+      in: query
+      required: false
+      schema: { type: integer, minimum: 0, default: 0 }
+
+  schemas:
+    OrderStatus:
+      type: string
+      enum: [CREATED, CONFIRMED, REJECTED, CANCELLED, COOKING, DELIVERING, DELIVERED]
+
+    ItemProblem:
+      type: string
+      description: Why one position cannot be ordered.
+      enum:
+        - NONE
+        - ITEM_NOT_FOUND
+        - ITEM_NOT_IN_MERCHANT
+        - ITEM_UNPUBLISHED
+        - ITEM_NOT_TRACKED
+        - ITEM_SALES_STOPPED
+        - INSUFFICIENT_UNITS
+
+    OrderProblem:
+      type: string
+      description: Why the basket as a whole cannot be ordered.
+      enum:
+        - MERCHANT_NOT_FOUND
+        - MERCHANT_SUSPENDED
+        - MERCHANT_NOT_ACCEPTING_ORDERS
+        - MIN_ORDER_NOT_MET
+
+    BasketItem:
+      type: object
+      required: [menu_item_id, qty]
+      properties:
+        menu_item_id: { type: string, format: uuid }
+        qty: { type: integer, format: int32, minimum: 1, maximum: 99 }
+
+    PreviewRequest:
+      type: object
+      required: [merchant_id, items]
+      properties:
+        merchant_id: { type: string, format: uuid }
+        items:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items: { $ref: "#/components/schemas/BasketItem" }
+
+    CreateOrderRequest:
+      allOf:
+        - $ref: "#/components/schemas/PreviewRequest"
+        - type: object
+          required: [customer_name, customer_phone, delivery_address]
+          properties:
+            customer_name: { type: string, minLength: 1, maxLength: 200 }
+            customer_phone: { type: string, minLength: 5, maxLength: 32 }
+            delivery_address: { type: string, minLength: 1, maxLength: 500 }
+            comment: { type: string, maxLength: 500 }
+            expected_total_minor:
+              type: integer
+              format: int64
+              minimum: 1
+              description: >-
+                The total the customer saw in the preview. When it is present
+                and no longer matches, the placement fails with 409
+                PRICE_CHANGED instead of charging a price the customer never
+                agreed to.
+
+    PreviewItem:
+      type: object
+      required: [menu_item_id, qty, unit_price_minor, line_total_minor, available_qty, problem]
+      properties:
+        menu_item_id: { type: string, format: uuid }
+        external_id: { type: string }
+        name: { type: string }
+        unit_price_minor: { type: integer, format: int64 }
+        qty: { type: integer, format: int32 }
+        line_total_minor: { type: integer, format: int64 }
+        available_qty:
+          type: integer
+          format: int32
+          description: Units inventory-service can still hold for this position.
+        problem: { $ref: "#/components/schemas/ItemProblem" }
+
+    Preview:
+      type: object
+      required:
+        [merchant_id, merchant_name, menu_version, items, items_total_minor,
+         delivery_fee_minor, total_minor, min_order_minor, currency, eta_minutes,
+         orderable, problems]
+      properties:
+        merchant_id: { type: string, format: uuid }
+        merchant_name: { type: string }
+        menu_version:
+          type: integer
+          format: int64
+          description: Menu version the prices were quoted at.
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/PreviewItem" }
+        items_total_minor:
+          type: integer
+          format: int64
+          description: Sum of the positions that can be ordered.
+        delivery_fee_minor: { type: integer, format: int64 }
+        total_minor: { type: integer, format: int64 }
+        min_order_minor:
+          type: integer
+          format: int64
+          description: Minimum the outlet accepts; it applies to the positions only.
+        currency: { type: string, enum: [RUB] }
+        eta_minutes: { type: integer, format: int32 }
+        orderable: { type: boolean }
+        problems:
+          type: array
+          items: { $ref: "#/components/schemas/OrderProblem" }
+
+    OrderItem:
+      type: object
+      required: [menu_item_id, external_id, name, unit_price_minor, qty, line_total_minor]
+      properties:
+        menu_item_id: { type: string, format: uuid }
+        external_id: { type: string }
+        name: { type: string }
+        unit_price_minor:
+          type: integer
+          format: int64
+          description: Price snapshot taken at placement time.
+        qty: { type: integer, format: int32 }
+        line_total_minor: { type: integer, format: int64 }
+
+    Order:
+      type: object
+      required:
+        [order_id, merchant_id, merchant_name, customer_id, status, items,
+         items_total_minor, delivery_fee_minor, total_minor, currency,
+         eta_minutes, customer_name, customer_phone, delivery_address,
+         created_at, updated_at]
+      properties:
+        order_id: { type: string, format: uuid }
+        merchant_id: { type: string, format: uuid }
+        merchant_name: { type: string }
+        customer_id: { type: string, format: uuid }
+        status: { $ref: "#/components/schemas/OrderStatus" }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/OrderItem" }
+        items_total_minor: { type: integer, format: int64 }
+        delivery_fee_minor: { type: integer, format: int64 }
+        total_minor: { type: integer, format: int64 }
+        currency: { type: string, enum: [RUB] }
+        eta_minutes: { type: integer, format: int32 }
+        reject_reason: { type: string }
+        customer_name: { type: string }
+        customer_phone: { type: string }
+        delivery_address: { type: string }
+        comment: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    OrderPage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Order" }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    AcceptRequest:
+      type: object
+      properties:
+        eta_minutes:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 240
+          description: >-
+            The merchant's own estimate. Zero keeps the average of the outlet,
+            which the order already carries.
+
+    RejectRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason: { type: string, minLength: 1, maxLength: 200 }
+
+    StatusRequest:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [COOKING, DELIVERING, DELIVERED]
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            request_id: { type: string }
+            details:
+              type: array
+              items:
+                type: object
+                required: [field, reason]
+                properties:
+                  field: { type: string }
+                  reason: { type: string }
+
+  responses:
+    BadRequest:
+      description: The body is not valid JSON or contains unknown fields
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: The access key is missing, unknown or revoked
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    OrderNotFound:
+      description: No such order for this caller (code ORDER_NOT_FOUND)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    MerchantNotFound:
+      description: The merchant does not exist (code MERCHANT_NOT_FOUND)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotOrderable:
+      description: >-
+        The basket cannot be placed. The code names the dominant reason - one
+        of the ItemProblem or OrderProblem values, or PRICE_CHANGED - and the
+        details list every position and rule that failed.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    StateConflict:
+      description: >-
+        The order is not in a status the requested move is allowed from
+        (code ORDER_STATE_CONFLICT)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    PayloadTooLarge:
+      description: The request body exceeds the configured limit
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    UnsupportedMediaType:
+      description: Content-Type is not application/json
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationFailed:
+      description: The request failed validation (code VALIDATION_FAILED)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    DependencyUnavailable:
+      description: >-
+        merchant-service, catalog-service or inventory-service could not be
+        reached (code DEPENDENCY_UNAVAILABLE)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }

@@ -1,0 +1,144 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - contextcheck
+    - depguard
+    - errorlint
+    - gocritic
+    - goconst
+    - misspell
+    - nilerr
+    - noctx
+    - revive
+    - rowserrcheck
+    - sqlclosecheck
+    - unconvert
+    - wastedassign
+  settings:
+    depguard:
+      rules:
+        # The domain layer must stay free of infrastructure. If this rule
+        # fires, a business rule started depending on a transport or a driver.
+        domain-purity:
+          files:
+            - "**/internal/*/domain/**"
+          deny:
+            - pkg: "net/http"
+              desc: the domain layer must not depend on transport
+            - pkg: "github.com/jackc/pgx/v5"
+              desc: the domain layer must not depend on the database driver
+            - pkg: "google.golang.org/grpc"
+              desc: the domain layer must not depend on gRPC
+            - pkg: "github.com/avito-kitchen/platform/gen"
+              desc: the domain layer must not depend on generated transport models
+        # Use cases orchestrate the domain through ports; they must not reach
+        # into adapters or speak a transport protocol directly.
+        app-purity:
+          files:
+            - "**/internal/*/app/**"
+          deny:
+            - pkg: "net/http"
+              desc: use cases must not depend on transport
+            - pkg: "github.com/jackc/pgx/v5"
+              desc: use cases must talk to storage through ports
+            - pkg: "github.com/avito-kitchen/platform/internal/merchant/adapters"
+              desc: use cases must not depend on adapters
+            - pkg: "github.com/avito-kitchen/platform/internal/inventory/adapters"
+              desc: use cases must not depend on adapters
+            - pkg: "github.com/avito-kitchen/platform/internal/catalog/adapters"
+              desc: use cases must not depend on adapters
+            - pkg: "github.com/avito-kitchen/platform/internal/order/adapters"
+              desc: use cases must not depend on adapters
+            - pkg: "github.com/avito-kitchen/platform/internal/partnerpos/adapters"
+              desc: use cases must not depend on adapters
+        # Services own their data and integrate only through the published
+        # contracts. A cross-service import would bypass that boundary.
+        service-isolation-merchant:
+          files:
+            - "**/internal/merchant/**"
+          deny:
+            - pkg: "github.com/avito-kitchen/platform/internal/catalog"
+              desc: cross-service imports are forbidden, integrate over gRPC
+            - pkg: "github.com/avito-kitchen/platform/internal/inventory"
+              desc: cross-service imports are forbidden, integrate over gRPC
+            - pkg: "github.com/avito-kitchen/platform/internal/order"
+              desc: cross-service imports are forbidden, integrate over gRPC
+        service-isolation-inventory:
+          files:
+            - "**/internal/inventory/**"
+          deny:
+            - pkg: "github.com/avito-kitchen/platform/internal/merchant"
+              desc: cross-service imports are forbidden, integrate over gRPC
+            - pkg: "github.com/avito-kitchen/platform/internal/catalog"
+              desc: cross-service imports are forbidden, integrate over gRPC
+            - pkg: "github.com/avito-kitchen/platform/internal/order"
+              desc: cross-service imports are forbidden, integrate over gRPC
+        service-isolation-catalog:
+          files:
+            - "**/internal/catalog/**"
+          deny:
+            - pkg: "github.com/avito-kitchen/platform/internal/merchant"
+              desc: cross-service imports are forbidden, integrate over gRPC
+            - pkg: "github.com/avito-kitchen/platform/internal/inventory"
+              desc: cross-service imports are forbidden, integrate over gRPC
+            - pkg: "github.com/avito-kitchen/platform/internal/order"
+              desc: cross-service imports are forbidden, integrate over gRPC
+        service-isolation-order:
+          files:
+            - "**/internal/order/**"
+          deny:
+            - pkg: "github.com/avito-kitchen/platform/internal/merchant"
+              desc: cross-service imports are forbidden, integrate over gRPC
+            - pkg: "github.com/avito-kitchen/platform/internal/catalog"
+              desc: cross-service imports are forbidden, integrate over gRPC
+            - pkg: "github.com/avito-kitchen/platform/internal/inventory"
+              desc: cross-service imports are forbidden, integrate over gRPC
+        partner-pos-is-external:
+          files:
+            - "**/internal/partnerpos/**"
+          deny:
+            - pkg: "github.com/avito-kitchen/platform/internal/merchant"
+              desc: partner-pos is an external system, it integrates over the public HTTP API
+            - pkg: "github.com/avito-kitchen/platform/internal/catalog"
+              desc: partner-pos is an external system, it integrates over the public HTTP API
+            - pkg: "github.com/avito-kitchen/platform/internal/inventory"
+              desc: partner-pos is an external system, it integrates over the public HTTP API
+            - pkg: "github.com/avito-kitchen/platform/internal/order"
+              desc: partner-pos is an external system, it integrates over the public HTTP API
+            - pkg: "github.com/avito-kitchen/platform/gen/grpc"
+              desc: partner-pos has no access to the internal gRPC network
+        # Shared technical packages must not learn about any service's domain.
+        shared-packages:
+          files:
+            - "**/pkg/**"
+          deny:
+            - pkg: "github.com/avito-kitchen/platform/internal"
+              desc: pkg must not contain or depend on business logic
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+        - name: error-strings
+        - name: context-as-argument
+    goconst:
+      min-len: 4
+      min-occurrences: 4
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt
+
+exclusions:
+  paths:
+    - gen

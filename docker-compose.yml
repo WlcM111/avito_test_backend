@@ -1,0 +1,292 @@
+# Local environment of Avito.Kitchen.
+#
+# The stack contains the four business services - merchant-service,
+# inventory-service, catalog-service and order-service - and partner-pos, the
+# demonstration till of one outlet. The till is an external client of the
+# platform: it has no database and talks only to the public HTTP ports.
+#
+# One PostgreSQL instance hosts one logical database per service, each with its
+# own role. Cross-database access is not granted to any service role.
+
+name: avito-kitchen
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: postgres
+      # Read by deploy/postgres/init/02-role-passwords.sh during the first
+      # initialisation, so a password changed in .env reaches the role as well
+      # as the DSN. Without them the roles would keep the literals of
+      # 01-databases.sql and every service would fail to authenticate.
+      MERCHANT_SVC_PASSWORD: ${MERCHANT_SVC_PASSWORD:-merchant_svc}
+      MERCHANT_MIGRATOR_PASSWORD: ${MERCHANT_MIGRATOR_PASSWORD:-merchant_migrator}
+      INVENTORY_SVC_PASSWORD: ${INVENTORY_SVC_PASSWORD:-inventory_svc}
+      INVENTORY_MIGRATOR_PASSWORD: ${INVENTORY_MIGRATOR_PASSWORD:-inventory_migrator}
+      CATALOG_SVC_PASSWORD: ${CATALOG_SVC_PASSWORD:-catalog_svc}
+      CATALOG_MIGRATOR_PASSWORD: ${CATALOG_MIGRATOR_PASSWORD:-catalog_migrator}
+      ORDERS_SVC_PASSWORD: ${ORDERS_SVC_PASSWORD:-orders_svc}
+      ORDERS_MIGRATOR_PASSWORD: ${ORDERS_MIGRATOR_PASSWORD:-orders_migrator}
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      # Порт хоста намеренно не 5432: на машине разработчика или проверяющего
+      # обычно уже слушает свой PostgreSQL, и стенд не поднялся бы. Внутри сети
+      # Compose сервисы по-прежнему ходят на postgres:5432.
+      - "${POSTGRES_PORT:-5499}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  merchant-migrate:
+    build:
+      context: .
+      dockerfile: deploy/migrate.Dockerfile
+    environment:
+      MIGRATE_SERVICE: merchant
+      DATABASE_URL: postgres://merchant_migrator:${MERCHANT_MIGRATOR_PASSWORD:-merchant_migrator}@postgres:5432/merchant?sslmode=disable
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  merchant-service:
+    build:
+      context: .
+      dockerfile: deploy/merchant-service.Dockerfile
+    environment:
+      SERVICE_NAME: merchant-service
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      HTTP_ADDR: ":8080"
+      GRPC_ADDR: ":9090"
+      OPS_ADDR: ":9091"
+      DATABASE_URL: postgres://merchant_svc:${MERCHANT_SVC_PASSWORD:-merchant_svc}@postgres:5432/merchant?sslmode=disable
+      DB_MAX_CONNS: "10"
+      DB_MIN_CONNS: "2"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      merchant-migrate:
+        condition: service_completed_successfully
+    ports:
+      # Public HTTP API. The gRPC and ops ports stay on the internal network.
+      - "${MERCHANT_HTTP_PORT:-8081}:8080"
+      # Служебный листенер /healthz и /readyz: публикуется, чтобы
+      # проверки готовности были доступны с хоста, как и smoke-скрипты.
+      - "${MERCHANT_OPS_PORT:-9091}:9091"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9091/readyz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  inventory-migrate:
+    build:
+      context: .
+      dockerfile: deploy/migrate.Dockerfile
+    environment:
+      MIGRATE_SERVICE: inventory
+      DATABASE_URL: postgres://inventory_migrator:${INVENTORY_MIGRATOR_PASSWORD:-inventory_migrator}@postgres:5432/inventory?sslmode=disable
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  inventory-service:
+    build:
+      context: .
+      dockerfile: deploy/inventory-service.Dockerfile
+    environment:
+      SERVICE_NAME: inventory-service
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      HTTP_ADDR: ":8080"
+      GRPC_ADDR: ":9090"
+      OPS_ADDR: ":9091"
+      DATABASE_URL: postgres://inventory_svc:${INVENTORY_SVC_PASSWORD:-inventory_svc}@postgres:5432/inventory?sslmode=disable
+      DB_MAX_CONNS: "10"
+      DB_MIN_CONNS: "2"
+      # inventory-service does not own merchant identity: it resolves access
+      # keys through merchant-service over the internal gRPC port.
+      MERCHANT_GRPC_TARGET: "dns:///merchant-service:9090"
+      RESERVATION_DEFAULT_TTL: ${RESERVATION_DEFAULT_TTL:-30m}
+      SWEEPER_INTERVAL: ${SWEEPER_INTERVAL:-1m}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      inventory-migrate:
+        condition: service_completed_successfully
+      merchant-service:
+        condition: service_healthy
+    ports:
+      - "${INVENTORY_HTTP_PORT:-8083}:8080"
+      # Служебный листенер /healthz и /readyz: публикуется, чтобы
+      # проверки готовности были доступны с хоста, как и smoke-скрипты.
+      - "${INVENTORY_OPS_PORT:-9093}:9091"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9091/readyz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  catalog-migrate:
+    build:
+      context: .
+      dockerfile: deploy/migrate.Dockerfile
+    environment:
+      MIGRATE_SERVICE: catalog
+      DATABASE_URL: postgres://catalog_migrator:${CATALOG_MIGRATOR_PASSWORD:-catalog_migrator}@postgres:5432/catalog?sslmode=disable
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  catalog-service:
+    build:
+      context: .
+      dockerfile: deploy/catalog-service.Dockerfile
+    environment:
+      SERVICE_NAME: catalog-service
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      HTTP_ADDR: ":8080"
+      GRPC_ADDR: ":9090"
+      OPS_ADDR: ":9091"
+      DATABASE_URL: postgres://catalog_svc:${CATALOG_SVC_PASSWORD:-catalog_svc}@postgres:5432/catalog?sslmode=disable
+      DB_MAX_CONNS: "10"
+      DB_MIN_CONNS: "2"
+      # catalog-service does not own merchant identity: it resolves access
+      # keys through merchant-service over the internal gRPC port.
+      MERCHANT_GRPC_TARGET: "dns:///merchant-service:9090"
+      # A published snapshot carries a whole menu, so the body limit is larger
+      # than the default of the services that accept single records.
+      HTTP_MAX_BODY_BYTES: ${CATALOG_MAX_BODY_BYTES:-1048576}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      catalog-migrate:
+        condition: service_completed_successfully
+      merchant-service:
+        condition: service_healthy
+    ports:
+      - "${CATALOG_HTTP_PORT:-8082}:8080"
+      # Служебный листенер /healthz и /readyz: публикуется, чтобы
+      # проверки готовности были доступны с хоста, как и smoke-скрипты.
+      - "${CATALOG_OPS_PORT:-9092}:9091"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9091/readyz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  order-migrate:
+    build:
+      context: .
+      dockerfile: deploy/migrate.Dockerfile
+    environment:
+      MIGRATE_SERVICE: orders
+      DATABASE_URL: postgres://orders_migrator:${ORDERS_MIGRATOR_PASSWORD:-orders_migrator}@postgres:5432/orders?sslmode=disable
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  order-service:
+    build:
+      context: .
+      dockerfile: deploy/order-service.Dockerfile
+    environment:
+      SERVICE_NAME: order-service
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      HTTP_ADDR: ":8080"
+      OPS_ADDR: ":9091"
+      DATABASE_URL: postgres://orders_svc:${ORDERS_SVC_PASSWORD:-orders_svc}@postgres:5432/orders?sslmode=disable
+      DB_MAX_CONNS: "10"
+      DB_MIN_CONNS: "2"
+      # order-service owns neither merchants, nor the menu, nor the units. It
+      # reaches all three owners over their internal gRPC ports.
+      MERCHANT_GRPC_TARGET: "dns:///merchant-service:9090"
+      CATALOG_GRPC_TARGET: "dns:///catalog-service:9090"
+      INVENTORY_GRPC_TARGET: "dns:///inventory-service:9090"
+      RESERVATION_TTL: ${RESERVATION_TTL:-30m}
+      OUTBOX_INTERVAL: ${OUTBOX_INTERVAL:-1s}
+      OUTBOX_BATCH: ${OUTBOX_BATCH:-50}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      order-migrate:
+        condition: service_completed_successfully
+      merchant-service:
+        condition: service_healthy
+      catalog-service:
+        condition: service_healthy
+      inventory-service:
+        condition: service_healthy
+    ports:
+      - "${ORDER_HTTP_PORT:-8084}:8080"
+      # Служебный листенер /healthz и /readyz: публикуется, чтобы
+      # проверки готовности были доступны с хоста, как и smoke-скрипты.
+      - "${ORDER_OPS_PORT:-9094}:9091"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9091/readyz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  # partner-pos models an external organisation (requirement A-06): it has no
+  # database and no access to the internal gRPC network. It authenticates with
+  # a merchant access key like any other outlet and reaches the platform only
+  # through the public HTTP ports of the three services.
+  partner-pos:
+    build:
+      context: .
+      dockerfile: deploy/partner-pos.Dockerfile
+    environment:
+      SERVICE_NAME: partner-pos
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      HTTP_ADDR: ":8080"
+      OPS_ADDR: ":9091"
+      CATALOG_BASE_URL: "http://catalog-service:8080"
+      INVENTORY_BASE_URL: "http://inventory-service:8080"
+      ORDER_BASE_URL: "http://order-service:8080"
+      PARTNER_POS_API_KEY: ${PARTNER_POS_API_KEY:-dev-merchant-key-kafe-primer-0001}
+      PUBLISH_ON_START: ${POS_PUBLISH_ON_START:-true}
+      STOCK_SYNC_INTERVAL: ${POS_STOCK_SYNC_INTERVAL:-1m}
+      ORDER_POLL_INTERVAL: ${POS_ORDER_POLL_INTERVAL:-5s}
+      KITCHEN_STEP: ${POS_KITCHEN_STEP:-20s}
+    depends_on:
+      catalog-service:
+        condition: service_healthy
+      inventory-service:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+    ports:
+      - "${POS_HTTP_PORT:-8085}:8080"
+      # Служебный листенер /healthz и /readyz: публикуется, чтобы
+      # проверки готовности были доступны с хоста, как и smoke-скрипты.
+      - "${POS_OPS_PORT:-9095}:9091"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9091/readyz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  postgres-data:

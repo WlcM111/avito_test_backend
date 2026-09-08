@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+package inventory.v1;
+
+option go_package = "github.com/avito-kitchen/platform/gen/grpc/inventory/v1;inventoryv1";
+
+// InventoryService is the internal contract of inventory-service: the single
+// source of truth for the per-unit availability of menu items.
+//
+// Accounting model: the unit of accounting is ONE sellable unit of a menu item
+// at a merchant. Units are fungible and counted; they are NOT individually
+// identified (no serial numbers). The accounting object ("stock item") is the
+// pair (merchant_id, menu_item_id) and carries two independent dimensions:
+//   * sales_state - the merchant's stop-list switch;
+//   * quantities  - on_hand_qty and reserved_qty, in whole units.
+// Enabling sales never confirms any quantity: a stock item may be ENABLED with
+// on_hand_qty = 0 and is then not orderable.
+//
+// Consumers: order-service.
+service InventoryService {
+  // GetAvailability reports the current per-unit availability. Read-only.
+  rpc GetAvailability(GetAvailabilityRequest) returns (GetAvailabilityResponse);
+  // Reserve holds the requested number of units for all lines atomically
+  // (all-or-nothing). Idempotent by reservation_id.
+  rpc Reserve(ReserveRequest) returns (ReserveResponse);
+  // CommitReservation consumes the held units. Idempotent by reservation_id.
+  rpc CommitReservation(CommitReservationRequest) returns (CommitReservationResponse);
+  // ReleaseReservation returns the held units to availability.
+  // Idempotent by reservation_id.
+  rpc ReleaseReservation(ReleaseReservationRequest) returns (ReleaseReservationResponse);
+}
+
+enum SalesState {
+  SALES_STATE_UNSPECIFIED = 0;
+  SALES_STATE_ENABLED = 1;
+  SALES_STATE_STOPPED = 2;
+}
+
+enum ReservationState {
+  RESERVATION_STATE_UNSPECIFIED = 0;
+  RESERVATION_STATE_HELD = 1;
+  RESERVATION_STATE_COMMITTED = 2;
+  RESERVATION_STATE_RELEASED = 3;
+}
+
+enum LineProblem {
+  LINE_PROBLEM_UNSPECIFIED = 0;
+  LINE_PROBLEM_NONE = 1;
+  LINE_PROBLEM_NOT_TRACKED = 2;      // no stock item exists for this menu item
+  LINE_PROBLEM_SALES_STOPPED = 3;    // merchant stop-list
+  LINE_PROBLEM_INSUFFICIENT_UNITS = 4;
+}
+
+enum ReleaseReason {
+  RELEASE_REASON_UNSPECIFIED = 0;
+  RELEASE_REASON_ORDER_REJECTED = 1;
+  RELEASE_REASON_ORDER_CANCELLED = 2;
+  RELEASE_REASON_ORDER_EXPIRED = 3;
+}
+
+message StockLine {
+  string menu_item_id = 1;
+  int32 qty = 2; // whole units, > 0
+}
+
+message Availability {
+  string menu_item_id = 1;
+  SalesState sales_state = 2;
+  int32 on_hand_qty = 3;
+  int32 reserved_qty = 4;
+  int32 available_qty = 5; // on_hand_qty - reserved_qty
+  bool tracked = 6;
+  int64 version = 7;
+}
+
+message GetAvailabilityRequest {
+  string merchant_id = 1;
+  repeated string menu_item_ids = 2;
+}
+
+message GetAvailabilityResponse {
+  repeated Availability items = 1;
+}
+
+message ReserveRequest {
+  // reservation_id equals the order id; it is the idempotency key.
+  string reservation_id = 1;
+  string merchant_id = 2;
+  repeated StockLine lines = 3;
+  int32 ttl_seconds = 4;
+  string request_id = 5;
+}
+
+message ReservationLineResult {
+  string menu_item_id = 1;
+  int32 requested_qty = 2;
+  int32 available_qty = 3;
+  LineProblem problem = 4;
+}
+
+message ReserveResponse {
+  bool reserved = 1;
+  bool already_existed = 2;
+  ReservationState state = 3;
+  string expires_at = 4; // RFC 3339, empty when not reserved
+  repeated ReservationLineResult lines = 5;
+}
+
+message CommitReservationRequest {
+  string reservation_id = 1;
+  string request_id = 2;
+}
+
+message CommitReservationResponse {
+  ReservationState state = 1;
+  bool already_committed = 2;
+}
+
+message ReleaseReservationRequest {
+  string reservation_id = 1;
+  ReleaseReason reason = 2;
+  string request_id = 3;
+}
+
+message ReleaseReservationResponse {
+  ReservationState state = 1;
+  bool already_released = 2;
+}
