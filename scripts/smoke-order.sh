@@ -78,13 +78,22 @@ basket() { printf '{"merchant_id":"%s","items":[{"menu_item_id":"%s","qty":%s}],
   "customer_name":"Иван","customer_phone":"+79990000001",
   "delivery_address":"Невский проспект, 1"}' "$MERCHANT_ID" "$1" "$2"; }
 
+# Тело предпросмотра отличается от тела оформления: PreviewRequest состоит
+# только из merchant_id и items, а order-service отвергает неизвестные поля.
+preview_body() { printf '{"merchant_id":"%s","items":[{"menu_item_id":"%s","qty":%s}]}' \
+  "$MERCHANT_ID" "$1" "$2"; }
+
+# Минимальная сумма демонстрационного заведения — 50 000 копеек при цене
+# позиции 42 000–43 000, поэтому корзина «на один заказ» берёт две штуки.
+MIN_ORDER_QTY=2
+
 call "preview"                        200 -H 'Content-Type: application/json' \
-     -d "$(basket "$ITEM_SELLABLE" 3)" "$BASE_URL/api/v1/orders/preview"
+     -d "$(preview_body "$ITEM_SELLABLE" 3)" "$BASE_URL/api/v1/orders/preview"
 check "preview is orderable"          "$(json "['orderable']")" "True"
 total="$(json "['total_minor']")"
 
 call "preview of a stop-listed item"  200 -H 'Content-Type: application/json' \
-     -d "$(basket "$ITEM_STOPPED" 1)" "$BASE_URL/api/v1/orders/preview"
+     -d "$(preview_body "$ITEM_STOPPED" 1)" "$BASE_URL/api/v1/orders/preview"
 check "stop list is reported"         "$(json "['items'][0]['problem']")" "ITEM_SALES_STOPPED"
 check "not orderable"                 "$(json "['orderable']")" "False"
 
@@ -179,7 +188,7 @@ call "cancelling again is idempotent" 200 -X POST -H "X-Customer-Id: $CUSTOMER_I
 before="$(available "$ITEM_SELLABLE")"
 call "create an order to refuse"      201 -X POST -H 'Content-Type: application/json' \
      -H "X-Customer-Id: $CUSTOMER_ID" -H "Idempotency-Key: smoke-reject-$CUSTOMER_ID" \
-     -d "$(basket "$ITEM_SELLABLE" 1)" "$BASE_URL/api/v1/orders"
+     -d "$(basket "$ITEM_SELLABLE" "$MIN_ORDER_QTY")" "$BASE_URL/api/v1/orders"
 reject_id="$(json "['order_id']")"
 call "refuse it"                      200 -X POST -H "X-Api-Key: $API_KEY" \
      -H 'Content-Type: application/json' -d '{"reason":"закончились продукты"}' \

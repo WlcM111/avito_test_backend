@@ -63,26 +63,18 @@ func run() error {
 		APIKey:           cfg.APIKey,
 		Timeout:          cfg.PlatformTimeout,
 	})
+	// Публикация меню и выталкивание остатков живут в фоновом цикле, а не
+	// здесь: первый его проход выполняется сразу и делает то же самое, но
+	// повторяется до успеха, если платформа ещё прогревается. Отдельная
+	// «жадная» попытка при старте давала ровно одну попытку — после её сбоя
+	// касса оставалась неопубликованной до ручного POST /pos/publish.
 	service := app.NewService(client, domain.DefaultMenu(), logger, app.Config{
 		StockSyncInterval: cfg.StockSyncInterval,
 		PollInterval:      cfg.PollInterval,
 		KitchenStep:       cfg.KitchenStep,
 		OrderPageLimit:    cfg.OrderPageLimit,
+		AutoPublish:       cfg.PublishOnStart,
 	})
-
-	// Publishing at start-up is what makes `docker compose up` enough for the
-	// demonstration. A failure is not fatal: the platform may still be warming
-	// up, the stock synchroniser retries, and POST /pos/publish is available.
-	if cfg.PublishOnStart {
-		publishCtx, cancel := context.WithTimeout(ctx, 2*cfg.PlatformTimeout)
-		if _, err := service.PublishMenu(publishCtx); err != nil {
-			logger.Warn("initial menu publication failed, will retry with the stock loop",
-				slog.Any("error", err))
-		} else if _, err := service.SyncStock(publishCtx); err != nil {
-			logger.Warn("initial stock synchronisation failed", slog.Any("error", err))
-		}
-		cancel()
-	}
 
 	controlHandler := httpx.Chain(httpapi.NewHandler(service, logger).Routes(),
 		httpx.RequestID(),

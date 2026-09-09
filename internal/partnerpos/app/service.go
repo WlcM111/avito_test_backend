@@ -20,6 +20,10 @@ type Config struct {
 	KitchenStep time.Duration
 	// OrderPageLimit caps one poll of the queue.
 	OrderPageLimit int
+	// AutoPublish разрешает кассе публиковать своё меню самой: при старте и
+	// после любого сбоя, пока публикация не пройдёт. Выключенная касса ждёт
+	// явного POST /pos/publish.
+	AutoPublish bool
 }
 
 // Service implements the use cases of partner-pos.
@@ -33,6 +37,11 @@ type Service struct {
 	behavior  domain.Behavior
 	published bool
 	version   int64
+	// pendingSync означает, что касса изменила у себя остатки или стоп-лист и
+	// ещё не донесла это до платформы. Фоновый цикл выталкивает только такие
+	// изменения: слепая перезапись раз в минуту откатывала бы всё, что
+	// заведение или оператор сделали через API платформы.
+	pendingSync bool
 
 	platform Platform
 	logger   *slog.Logger
@@ -110,5 +119,14 @@ func (s *Service) PatchItem(externalID string, patch domain.ItemPatch) (domain.I
 	if err := s.menu.Validate(); err != nil {
 		return domain.Item{}, err
 	}
+	s.pendingSync = true
 	return item, nil
+}
+
+// pendingChanges reports whether the till has changes the platform has not
+// been told about yet.
+func (s *Service) pendingChanges() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.pendingSync
 }

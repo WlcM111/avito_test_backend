@@ -33,9 +33,13 @@
 | P-04 | §4.2 S-M3 | Касса устанавливает остаток в штуках абсолютным значением | `SetStock` → `PUT /api/v1/merchant/stock/{id}` | `UT: TestSyncStockNeedsAPublishedMenu`, smoke | выполнено |
 | P-05 | §4.2 S-M5 | Стоп-лист — отдельный вызов, количеств не меняет | `SetSalesState` → `PATCH …/stock/{id}` | `UT: TestSyncStockCarriesTheStopListSeparately` | выполнено |
 | P-06 | §4.2 S-M6 | Опрос очереди раз в 5 с | `ORDER_POLL_INTERVAL` по умолчанию `5s` | `SC`, `UT` | выполнено |
+| P-06a | §4.2 S-M6 | Касса не забирает заказы, которыми управляет кто-то другой | Режим по умолчанию `MANUAL`; автоматические режимы включаются явно через `PUT /pos/behavior` | `UT: TestDefaultBehaviorIsManual`, `TestDecideInManualModeTouchesNothing` | выполнено |
 | P-07 | §4.2 S-M7 | Подтверждение или отказ заказа | Режимы `AUTO_ACCEPT` и `AUTO_REJECT` | `UT: TestPollAcceptsNewOrders`, `TestPollRefusesWhenConfigured`, smoke | выполнено |
 | P-08 | §4.2 S-M8 | Продвижение статуса приготовления и доставки | Имитация кухни: один шаг за `KITCHEN_STEP`, ладдер `CONFIRMED → COOKING → DELIVERING → DELIVERED` | `UT: TestPollWalksThePreparationLadderOneStepAtATime`, smoke | выполнено |
 | P-09 | §5.3 | Публикация меню не создаёт остаток | Публикация и синхронизация — два отдельных шага; без публикации синхронизация отказывает | `UT: TestSyncStockNeedsAPublishedMenu` | выполнено |
+| P-09a | §5.3, §4 | Демонстрационное меню кассы повторяет seed платформы, иначе синхронизация уничтожает сценарии «ноль штук» и «стоп-лист» | `DefaultMenu`: POS-001 10 шт, POS-002 0 шт, POS-003 5 шт и стоп-лист | `UT: TestDefaultMenuRepeatsThePlatformSeed` | выполнено |
+| P-09b | §11.1 | Касса не откатывает изменения, сделанные через API платформы | Выталкиваются только собственные изменения кассы | `UT: TestSyncPassPushesNothingWithoutOwnChanges` | выполнено |
+| P-09c | A-13, §2.3 п. 1 | Сбой платформы при старте не оставляет кассу неопубликованной | Фоновый цикл повторяет публикацию до успеха | `UT: TestRunStockSyncPublishesAndRecoversAfterAFailure` | выполнено |
 | P-10 | §6, A-10 | Соответствие `external_id` ↔ `menu_item_id` берётся из опубликованного меню, а не угадывается | `PublishMenu` читает меню обратно и заполняет соответствие | `UT: TestPublishMenuLearnsThePlatformIdentifiers` | выполнено |
 | P-11 | §11.1 | `context` во всех блокирующих вызовах, тайм-ауты, ограниченное число горутин, корректное завершение | `PLATFORM_TIMEOUT` на каждый вызов, четыре горутины в `main`, `RunStockSync`/`RunOrderPolling` завершаются по отмене | `UT: TestLoopsStopOnCancellation`, `SC` | выполнено |
 | P-12 | §7.1 | Единый конверт ошибок и коды: 404, 409, 422, 503, 500 без деталей | `internal/partnerpos/adapters/httpapi/router.go`, `toHTTPError` | `HT`, smoke | выполнено |

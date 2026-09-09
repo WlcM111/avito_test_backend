@@ -47,7 +47,9 @@ call "liveness"                     200 "$OPS_URL/healthz"
 call "readiness"                    200 "$OPS_URL/readyz"
 
 call "public menu"                  200 "$BASE_URL/api/v1/merchants/$MERCHANT_ID/menu"
-check "seeded menu version"         "$(json "['menu_version']")" "1"
+# Версия меню не проверяется на «1»: касса заведения публикует своё меню при
+# старте стенда, и это штатное поведение. Значимо, что меню опубликовано.
+check "menu is published"           "$(json "['menu_version'] > 0")" "True"
 check "seeded categories"           "$(json "['categories'].__len__()")" "2"
 # The catalogue owns no availability: a menu item carries a price, not a count.
 if json "['categories'][0]['items'][0]['available_qty']" >/dev/null 2>&1; then

@@ -76,6 +76,37 @@ func TestDecideLeavesTerminalOrdersAlone(t *testing.T) {
 	}
 }
 
+// В ручном режиме касса не трогает даже подтверждённые заказы: иначе имитация
+// кухни двигала бы заказы, которыми управляет кто-то другой.
+func TestDecideInManualModeTouchesNothing(t *testing.T) {
+	t.Parallel()
+	b := behavior(domain.ModeManual)
+	for _, status := range []string{
+		domain.StatusCreated, domain.StatusConfirmed,
+		domain.StatusCooking, domain.StatusDelivering,
+	} {
+		if d := domain.Decide(b, status, time.Hour, time.Minute); d.Action != domain.ActionHold {
+			t.Fatalf("%s в ручном режиме = %s, want HOLD", status, d.Action)
+		}
+	}
+}
+
+// Касса по умолчанию не вмешивается в очередь: автоматический приём включается
+// явно через PUT /pos/behavior.
+func TestDefaultBehaviorIsManual(t *testing.T) {
+	t.Parallel()
+	b := domain.DefaultBehavior()
+	if b.Mode != domain.ModeManual {
+		t.Fatalf("режим по умолчанию = %s, want MANUAL", b.Mode)
+	}
+	if err := b.Validate(); err != nil {
+		t.Fatalf("поведение по умолчанию должно быть валидным: %v", err)
+	}
+	if d := domain.Decide(b, domain.StatusCreated, 0, time.Minute); d.Action != domain.ActionHold {
+		t.Fatalf("новый заказ по умолчанию = %s, want HOLD", d.Action)
+	}
+}
+
 func TestDecideRespectsTheKitchenSwitch(t *testing.T) {
 	t.Parallel()
 	b := behavior(domain.ModeAutoAccept)
@@ -176,6 +207,34 @@ func TestDefaultMenuMatchesThePlatformSeed(t *testing.T) {
 	}
 	if len(categories[0].Items) != 2 || categories[0].Items[0].ExternalID != "POS-001" {
 		t.Fatalf("items are not ordered: %+v", categories[0].Items)
+	}
+}
+
+// Меню кассы обязано повторять демонстрационный seed платформы: иначе первая
+// же синхронизация сотрёт сценарии «разрешено, но ноль штук» и «есть штуки, но
+// стоп-лист», на которых держатся проверки §4 ТЗ.
+func TestDefaultMenuRepeatsThePlatformSeed(t *testing.T) {
+	t.Parallel()
+	menu := domain.DefaultMenu()
+	want := map[string]struct {
+		price   int64
+		qty     int32
+		stopped bool
+	}{
+		"POS-001": {42000, 10, false},
+		"POS-002": {56000, 0, false},
+		"POS-003": {15000, 5, true},
+	}
+	for id, w := range want {
+		item, ok := menu.Find(id)
+		if !ok {
+			t.Fatalf("позиция %s отсутствует", id)
+		}
+		if item.PriceMinor != w.price || item.OnHandQty != w.qty || item.SalesStopped != w.stopped {
+			t.Fatalf("%s = цена %d, %d шт, стоп-лист %v; ожидалось %d, %d, %v",
+				id, item.PriceMinor, item.OnHandQty, item.SalesStopped,
+				w.price, w.qty, w.stopped)
+		}
 	}
 }
 

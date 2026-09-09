@@ -52,6 +52,10 @@ func (s *Service) PublishMenu(ctx context.Context) (PublishResult, error) {
 	}
 	s.published = true
 	s.version = version
+	// Платформа только что узнала о меню, но не о количествах: публикация
+	// меню остатков не создаёт (§5.3 ТЗ). Поэтому после публикации касса
+	// обязана вытолкнуть свои остатки.
+	s.pendingSync = true
 	total := len(s.menu.Items)
 	s.mu.Unlock()
 

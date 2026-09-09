@@ -189,6 +189,18 @@ func basket(menuItemID string, qty int) string {
 	  "delivery_address":"Невский проспект, 1"}`, merchantID, menuItemID, qty)
 }
 
+// previewBody — тело предпросмотра. Оно отличается от тела оформления:
+// PreviewRequest состоит только из merchant_id и items, а order-service
+// отвергает неизвестные поля (400). Отправлять сюда контакты покупателя нельзя.
+func previewBody(menuItemID string, qty int) string {
+	return fmt.Sprintf(`{"merchant_id":"%s","items":[{"menu_item_id":"%s","qty":%d}]}`,
+		merchantID, menuItemID, qty)
+}
+
+// minOrderQty — количество, при котором корзина проходит минимальную сумму
+// демонстрационного заведения (50 000 копеек при цене позиции 42 000–43 000).
+const minOrderQty = 2
+
 // TestHappyPath walks the whole customer journey across all four services and
 // checks the state each of them ends up in.
 func TestHappyPath(t *testing.T) {
@@ -220,7 +232,7 @@ func TestHappyPath(t *testing.T) {
 
 	// Preview recalculates the basket against all three owners.
 	preview := s.expect(t, http.StatusOK, http.MethodPost,
-		s.order+"/api/v1/orders/preview", basket(itemSellable, 3), nil)
+		s.order+"/api/v1/orders/preview", previewBody(itemSellable, 3), nil)
 	var previewPayload struct {
 		Orderable  bool  `json:"orderable"`
 		TotalMinor int64 `json:"total_minor"`
@@ -395,7 +407,7 @@ func TestOrderIsScopedToItsCustomer(t *testing.T) {
 	customerID := uuid.NewString()
 
 	created := s.expect(t, http.StatusCreated, http.MethodPost,
-		s.order+"/api/v1/orders", basket(itemSellable, 1),
+		s.order+"/api/v1/orders", basket(itemSellable, minOrderQty),
 		customerHeaders(customerID, "e2e-scope-"+customerID))
 	var order orderPayload
 	created.decode(t, &order)

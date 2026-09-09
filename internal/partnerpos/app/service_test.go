@@ -106,14 +106,14 @@ func TestSyncStockCarriesTheStopListSeparately(t *testing.T) {
 		t.Fatalf("PublishMenu() = %v", err)
 	}
 	stopped := true
-	if _, err := svc.PatchItem("POS-003", domain.ItemPatch{SalesStopped: &stopped}); err != nil {
+	if _, err := svc.PatchItem("POS-001", domain.ItemPatch{SalesStopped: &stopped}); err != nil {
 		t.Fatalf("PatchItem() = %v", err)
 	}
 	if _, err := svc.SyncStock(context.Background()); err != nil {
 		t.Fatalf("SyncStock() = %v", err)
 	}
-	stock, _ := pf.Stock(testsupport.MenuItemStopped)
-	if !stock.Stopped || stock.Qty != 20 {
+	stock, _ := pf.Stock(testsupport.MenuItemSellable)
+	if !stock.Stopped || stock.Qty != 10 {
 		t.Fatalf("stock = %+v, want the stop list set and the quantity kept", stock)
 	}
 }
@@ -157,9 +157,22 @@ func TestSetBehaviorValidates(t *testing.T) {
 	}
 }
 
+// autoAccept переводит кассу в режим автоматического приёма: по умолчанию она
+// в очередь не вмешивается.
+func autoAccept(t *testing.T, svc *app.Service) {
+	t.Helper()
+	if _, err := svc.SetBehavior(domain.Behavior{
+		Mode: domain.ModeAutoAccept, ETAMinutes: domain.DefaultBehavior().ETAMinutes,
+		RejectReason: "нет", Kitchen: true,
+	}); err != nil {
+		t.Fatalf("SetBehavior() = %v", err)
+	}
+}
+
 func TestPollAcceptsNewOrders(t *testing.T) {
 	t.Parallel()
 	svc, pf := newService(t)
+	autoAccept(t, svc)
 	pf.SetOrders(order("o-1", domain.StatusCreated, 0))
 
 	result, err := svc.PollOrders(context.Background(), time.Now().UTC())
@@ -231,6 +244,7 @@ func TestPollLeavesOrdersAloneInManualMode(t *testing.T) {
 func TestPollWalksThePreparationLadderOneStepAtATime(t *testing.T) {
 	t.Parallel()
 	svc, pf := newService(t)
+	autoAccept(t, svc)
 	pf.SetOrders(order("o-4", domain.StatusConfirmed, 0))
 
 	if result, err := svc.PollOrders(context.Background(), time.Now().UTC()); err != nil || result.Advanced != 0 {
@@ -249,6 +263,7 @@ func TestPollWalksThePreparationLadderOneStepAtATime(t *testing.T) {
 func TestPollContinuesAfterOneFailure(t *testing.T) {
 	t.Parallel()
 	svc, pf := newService(t)
+	autoAccept(t, svc)
 	pf.SetOrders(order("o-5", domain.StatusCreated, 0), order("o-6", domain.StatusCreated, 0))
 	pf.DecideErr = app.Unavailable("order accept", errors.New("connection refused"))
 
@@ -282,6 +297,111 @@ func TestPublishReportsAnUnavailablePlatform(t *testing.T) {
 	if svc.Menu().Published {
 		t.Fatal("a failed publication must not mark the menu as published")
 	}
+}
+
+// Одна неудачная публикация не должна оставлять кассу неопубликованной
+// навсегда: фоновый цикл повторяет её до успеха и сразу выталкивает остатки.
+func TestRunStockSyncPublishesAndRecoversAfterAFailure(t *testing.T) {
+	t.Parallel()
+	pf := testsupport.NewPlatform()
+	pf.SetPublishErr(app.Unavailable("catalog publish menu", errors.New("connection refused")))
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := app.NewService(pf, domain.DefaultMenu(), logger, app.Config{
+		StockSyncInterval: time.Hour,
+		PollInterval:      5 * time.Millisecond,
+		KitchenStep:       time.Minute,
+		OrderPageLimit:    50,
+		AutoPublish:       true,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- svc.RunStockSync(ctx) }()
+
+	waitFor(t, 2*time.Second, func() bool { return pf.PublishAttempts() > 0 },
+		"цикл ни разу не попытался опубликовать меню")
+	if svc.Menu().Published {
+		t.Fatal("неудачная публикация не должна помечать меню опубликованным")
+	}
+
+	pf.SetPublishErr(nil)
+	waitFor(t, 5*time.Second, func() bool { return svc.Menu().Published },
+		"цикл не повторил публикацию после восстановления платформы")
+	waitFor(t, 5*time.Second, func() bool {
+		stock, ok := pf.Stock(testsupport.MenuItemSellable)
+		return ok && stock.Qty == 10
+	}, "остатки не выставлены после публикации")
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunStockSync() = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("цикл не остановился по отмене")
+	}
+}
+
+// Касса выталкивает только то, что изменила у себя: слепая перезапись раз в
+// минуту откатывала бы изменения, сделанные через API платформы.
+func TestSyncPassPushesNothingWithoutOwnChanges(t *testing.T) {
+	t.Parallel()
+	pf := testsupport.NewPlatform()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := app.NewService(pf, domain.DefaultMenu(), logger, app.Config{
+		StockSyncInterval: 5 * time.Millisecond,
+		PollInterval:      5 * time.Millisecond,
+		KitchenStep:       time.Minute,
+		OrderPageLimit:    50,
+		AutoPublish:       true,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- svc.RunStockSync(ctx) }()
+	waitFor(t, 2*time.Second, func() bool { return svc.Menu().Published },
+		"касса не опубликовала меню")
+	waitFor(t, 2*time.Second, func() bool {
+		stock, ok := pf.Stock(testsupport.MenuItemSellable)
+		return ok && stock.Qty == 10
+	}, "касса не выставила остатки после публикации")
+
+	// Заведение меняет остаток через API платформы, минуя кассу.
+	if err := pf.SetStock(context.Background(), testsupport.MenuItemSellable, 3, "merchant"); err != nil {
+		t.Fatalf("SetStock() = %v", err)
+	}
+	time.Sleep(50 * time.Millisecond) // несколько проходов цикла
+	if stock, _ := pf.Stock(testsupport.MenuItemSellable); stock.Qty != 3 {
+		t.Fatalf("остаток = %d, касса не должна откатывать чужие изменения", stock.Qty)
+	}
+
+	// А своё изменение касса доносит.
+	qty := int32(7)
+	if _, err := svc.PatchItem("POS-001", domain.ItemPatch{OnHandQty: &qty}); err != nil {
+		t.Fatalf("PatchItem() = %v", err)
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		stock, _ := pf.Stock(testsupport.MenuItemSellable)
+		return stock.Qty == 7
+	}, "касса не вытолкнула собственное изменение")
+
+	cancel()
+	<-done
+}
+
+// waitFor ждёт условия с ограниченным сроком: у фоновой работы нет момента,
+// в который можно проверить результат синхронно.
+func waitFor(t *testing.T, limit time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(limit)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal(msg)
 }
 
 // The loops must stop when the process is asked to stop.

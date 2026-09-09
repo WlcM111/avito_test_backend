@@ -36,6 +36,8 @@ type Platform struct {
 	Stocks      map[string]Stock
 	Orders      []app.Order
 
+	publishAttempts int
+
 	// Accepted, Rejected and Advanced record what the till asked the platform
 	// to do, so a test can prove the effect happened exactly once.
 	Accepted map[string]int32
@@ -43,6 +45,8 @@ type Platform struct {
 	Advanced map[string][]string
 
 	// PublishErr and friends let a test simulate an unavailable platform.
+	// Меняйте PublishErr через SetPublishErr, если касса уже работает в
+	// фоновом цикле: иначе гонка.
 	PublishErr error
 	FetchErr   error
 	StockErr   error
@@ -66,6 +70,21 @@ func NewPlatform() *Platform {
 	}
 }
 
+// SetPublishErr makes PublishMenu fail with err. Safe to call while the till
+// is running.
+func (p *Platform) SetPublishErr(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.PublishErr = err
+}
+
+// PublishAttempts reports how many times the till tried to publish its menu.
+func (p *Platform) PublishAttempts() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.publishAttempts
+}
+
 // SetOrders replaces the queue the fake platform reports.
 func (p *Platform) SetOrders(orders ...app.Order) {
 	p.mu.Lock()
@@ -85,6 +104,7 @@ func (p *Platform) Stock(menuItemID string) (Stock, bool) {
 func (p *Platform) PublishMenu(_ context.Context, menu domain.Menu) (int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.publishAttempts++
 	if p.PublishErr != nil {
 		return 0, p.PublishErr
 	}

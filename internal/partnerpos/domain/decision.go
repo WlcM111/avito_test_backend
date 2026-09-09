@@ -61,9 +61,15 @@ type Behavior struct {
 }
 
 // DefaultBehavior is what the till starts with.
+//
+// Режим по умолчанию — MANUAL: касса не трогает заказы, пока её явно не
+// переключили. Автоматический приём — демонстрационный режим, и включать его по
+// умолчанию нельзя: касса опрашивает ту же очередь заведения, что и любой
+// другой клиент merchant-API, и молча забирала бы заказы, которыми управляют
+// smoke-скрипты, сквозные тесты и человек с curl.
 func DefaultBehavior() Behavior {
 	return Behavior{
-		Mode:         ModeAutoAccept,
+		Mode:         ModeManual,
 		ETAMinutes:   25,
 		RejectReason: "закончились продукты",
 		Kitchen:      true,
@@ -126,6 +132,12 @@ var nextStatus = map[string]string{
 // state about orders, so restarting it changes nothing and a repeated poll
 // cannot move an order twice.
 func Decide(b Behavior, status string, age, step time.Duration) Decision {
+	// В ручном режиме касса не вмешивается ни во что: ни в новые заказы, ни в
+	// приготовление. Иначе имитация кухни двигала бы чужие подтверждённые
+	// заказы, даже когда касса «выключена».
+	if b.Mode == ModeManual {
+		return Decision{Action: ActionHold}
+	}
 	switch status {
 	case StatusCreated:
 		switch b.Mode {

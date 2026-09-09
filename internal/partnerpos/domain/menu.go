@@ -61,6 +61,12 @@ type Category struct {
 // are the ones the platform seed already knows (POS-001…POS-003), so the first
 // publication updates the seeded positions instead of creating duplicates and
 // the stock cards of inventory-service keep pointing at the same items.
+//
+// Количества и стоп-лист повторяют демонстрационный seed платформы
+// (migrations/inventory/0002_seed.sql) намеренно: касса — источник истины по
+// своим остаткам, и если бы её значения расходились с seed, первая же
+// синхронизация уничтожила бы сценарии «разрешено, но ноль штук» и «есть
+// штуки, но стоп-лист», на которых держатся проверки §4 ТЗ.
 func DefaultMenu() Menu {
 	return Menu{Items: []Item{
 		{
@@ -69,14 +75,19 @@ func DefaultMenu() Menu {
 			Category:    "Горячее", PriceMinor: 42000, Position: 0, OnHandQty: 10,
 		},
 		{
+			// Ноль штук при разрешённой продаже: платформа обязана считать
+			// позицию незаказуемой, пока заведение не укажет количество.
 			ExternalID: "POS-002", Name: "Котлета по-киевски",
 			Description: "Подаётся с картофельным пюре.",
-			Category:    "Горячее", PriceMinor: 56000, Position: 1, OnHandQty: 4,
+			Category:    "Горячее", PriceMinor: 56000, Position: 1, OnHandQty: 0,
 		},
 		{
+			// Штуки есть, но позиция в стоп-листе: стоп-лист и количество —
+			// независимые измерения (§5.3 ТЗ).
 			ExternalID: "POS-003", Name: "Морс клюквенный",
 			Description: "Домашний морс, 400 мл.",
-			Category:    "Напитки", PriceMinor: 15000, Position: 0, OnHandQty: 20,
+			Category:    "Напитки", PriceMinor: 15000, Position: 0, OnHandQty: 5,
+			SalesStopped: true,
 		},
 	}}
 }

@@ -47,7 +47,9 @@ check() {
 # so the check waits for the end state instead of assuming it.
 wait_status() {
   local id="$1" want="$2" got=""
-  for _ in $(seq 1 60); do
+  # Ладдер приготовления занимает три шага KITCHEN_STEP (по умолчанию 20 с)
+  # плюс задержку опроса очереди, поэтому ждём с запасом.
+  for _ in $(seq 1 150); do
     got="$(curl -s -H "X-Customer-Id: $CUSTOMER_ID" "$ORDER_URL/api/v1/orders/$id" \
       | python3 -c "import json,sys;print(json.load(sys.stdin)['status'])")"
     if [ "$got" = "$want" ]; then
@@ -105,7 +107,9 @@ call "refusal without a reason"     422 -X PUT -H 'Content-Type: application/jso
 call "unknown mode"                 422 -X PUT -H 'Content-Type: application/json' \
      -d '{"mode":"NOPE"}' "$BASE_URL/pos/behavior"
 
-basket() { printf '{"merchant_id":"%s","items":[{"menu_item_id":"%s","qty":1}],
+# Две штуки, а не одна: минимальная сумма демонстрационного заведения —
+# 50 000 копеек, а позиция стоит 43 000.
+basket() { printf '{"merchant_id":"%s","items":[{"menu_item_id":"%s","qty":2}],
   "customer_name":"Иван","customer_phone":"+79990000001",
   "delivery_address":"Невский проспект, 1"}' "$MERCHANT_ID" "$item_id"; }
 
@@ -129,6 +133,14 @@ wait_status "$accepted_id" "CONFIRMED"
 wait_status "$accepted_id" "DELIVERED"
 
 call "unknown endpoint"             404 "$BASE_URL/pos/nothing"
+
+# Возвращаем кассу в исходный режим: иначе она продолжит принимать заказы,
+# созданные другими проверками, и следующий прогон smoke-order станет
+# недетерминированным.
+call "restore the manual mode"      200 -X PUT -H 'Content-Type: application/json' \
+     -d '{"mode":"MANUAL","eta_minutes":25,"reject_reason":"закончились продукты","kitchen":true}' \
+     "$BASE_URL/pos/behavior"
+check "mode restored"               "$(json "['mode']")" "MANUAL"
 
 if [ "$failures" -ne 0 ]; then
   echo "smoke failed: $failures check(s)"
