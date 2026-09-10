@@ -169,6 +169,42 @@ func (s stack) waitForAvailability(t *testing.T, menuItemID string, want int32, 
 	t.Fatalf("availability of %s stayed at %d, want %d within %s", menuItemID, last, want, limit)
 }
 
+// stockCard читает карточку остатка глазами заведения.
+func (s stack) stockCard(t *testing.T, menuItemID string) (onHand, reserved int32) {
+	t.Helper()
+	resp := s.expect(t, http.StatusOK, http.MethodGet,
+		fmt.Sprintf("%s/api/v1/merchant/stock/%s", s.inventory, menuItemID), "", merchantHeaders())
+	var payload struct {
+		OnHandQty   int32 `json:"on_hand_qty"`
+		ReservedQty int32 `json:"reserved_qty"`
+	}
+	resp.decode(t, &payload)
+	return payload.OnHandQty, payload.ReservedQty
+}
+
+// waitForStock ждёт, пока карточка остатка придёт в конечное состояние.
+//
+// Для подтверждения заказа ждать по available_qty нельзя: он равен
+// on_hand - reserved и одинаков до фиксации и после неё, потому что удержание
+// превращается в списание. Ожидание по нему завершилось бы мгновенно, ещё до
+// того как решение доедет через outbox, и следующая же проверка увидела бы
+// прежнее количество.
+func (s stack) waitForStock(t *testing.T, menuItemID string, wantOnHand, wantReserved int32,
+	limit time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(limit)
+	var onHand, reserved int32
+	for time.Now().Before(deadline) {
+		onHand, reserved = s.stockCard(t, menuItemID)
+		if onHand == wantOnHand && reserved == wantReserved {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("card of %s stayed at on_hand=%d reserved=%d, want %d and %d within %s",
+		menuItemID, onHand, reserved, wantOnHand, wantReserved, limit)
+}
+
 type orderPayload struct {
 	OrderID         string `json:"order_id"`
 	Status          string `json:"status"`
@@ -283,20 +319,12 @@ func TestHappyPath(t *testing.T) {
 	s.expect(t, http.StatusOK, http.MethodPost,
 		fmt.Sprintf("%s/api/v1/merchant/orders/%s/accept", s.order, order.OrderID),
 		`{"eta_minutes":25}`, merchantHeaders())
-	s.waitForAvailability(t, itemSellable, before-3, 30*time.Second)
+	s.waitForStock(t, itemSellable, before-3, 0, 30*time.Second)
 
-	var onHand int32
-	stock := s.expect(t, http.StatusOK, http.MethodGet,
-		fmt.Sprintf("%s/api/v1/merchant/stock/%s", s.inventory, itemSellable), "", merchantHeaders())
-	var stockPayload struct {
-		OnHandQty   int32 `json:"on_hand_qty"`
-		ReservedQty int32 `json:"reserved_qty"`
-	}
-	stock.decode(t, &stockPayload)
-	onHand = stockPayload.OnHandQty
-	if onHand != 7 || stockPayload.ReservedQty != 0 {
+	onHand, reserved := s.stockCard(t, itemSellable)
+	if onHand != before-3 || reserved != 0 {
 		t.Fatalf("on hand = %d, reserved = %d, want the units consumed, not held",
-			onHand, stockPayload.ReservedQty)
+			onHand, reserved)
 	}
 
 	// The merchant walks the order to the customer.

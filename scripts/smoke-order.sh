@@ -50,8 +50,34 @@ available() {
     | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['items'][0]['available_qty'])"
 }
 
+# on_hand <menu_item_id> - карточка остатка глазами заведения: количество и
+# удержание одной строкой.
+on_hand() {
+  curl -s -H "X-Api-Key: $API_KEY" "$INVENTORY_URL/api/v1/merchant/stock/$1" \
+    | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['on_hand_qty'],d['reserved_qty'])"
+}
+
+# wait_consumed <menu_item_id> <want_on_hand> - подтверждение заказа превращает
+# удержание в списание. Ждать этого по available_qty нельзя: он равен
+# on_hand - reserved и до фиксации, и после неё одинаков, поэтому ожидание
+# завершилось бы мгновенно, ещё до того как решение доедет через outbox.
+wait_consumed() {
+  local item="$1" want="$2" got=""
+  for _ in $(seq 1 60); do
+    got="$(on_hand "$item")"
+    if [ "$got" = "$want 0" ]; then
+      printf 'OK   %-48s %s\n' "units consumed, nothing held" "$got"
+      return 0
+    fi
+    sleep 0.5
+  done
+  printf 'FAIL %-48s got "%s" want "%s 0"\n' "units never settled after the confirmation" "$got" "$want"
+  failures=$((failures + 1))
+}
+
 # wait_available <menu_item_id> <want> - the terminal decision travels through
 # the outbox, so the check waits for the end state instead of assuming it.
+# Годится для возврата штук: при отмене и отказе available_qty растёт.
 wait_available() {
   local item="$1" want="$2" got=""
   for _ in $(seq 1 60); do
@@ -145,8 +171,8 @@ check "the estimate is kept"          "$(json "['eta_minutes']")" "25"
 call "accepting again is idempotent"  200 -X POST -H "X-Api-Key: $API_KEY" \
      -H 'Content-Type: application/json' -d '{"eta_minutes":25}' \
      "$BASE_URL/api/v1/merchant/orders/$order_id/accept"
-# Confirming consumes the units: availability stays down and the hold is gone.
-wait_available "$ITEM_SELLABLE" "$((before - 3))"
+# Confirming consumes the units: on_hand drops by three and the hold is gone.
+wait_consumed "$ITEM_SELLABLE" "$((before - 3))"
 call "the units were consumed"        200 -H "X-Api-Key: $API_KEY" \
      "$INVENTORY_URL/api/v1/merchant/stock/$ITEM_SELLABLE"
 check "on hand decreased"             "$(json "['on_hand_qty']")" "$((before - 3))"

@@ -12,6 +12,11 @@ MERCHANT_ID="${MERCHANT_ID:-11111111-1111-4111-8111-111111111111}"
 ITEM_SELLABLE="${ITEM_SELLABLE:-a1111111-1111-4111-8111-111111111111}"
 ITEM_EMPTY="${ITEM_EMPTY:-a1111111-1111-4111-8111-222222222222}"
 ITEM_STOPPED="${ITEM_STOPPED:-a1111111-1111-4111-8111-333333333333}"
+# Корректировка остатка идемпотентна по operation_key, поэтому ключ обязан быть
+# уникальным для прогона. С фиксированным значением второй запуск скрипта против
+# той же базы обречён: первая же корректировка вернулась бы как дубль, дельта не
+# применилась бы, и проверки количества провалились бы на ровном месте.
+OP_KEY="${OP_KEY:-smoke-$(python3 -c 'import uuid;print(uuid.uuid4())')}"
 
 failures=0
 
@@ -60,10 +65,12 @@ call "set without quantity"        422 -X PUT -H "X-Api-Key: $API_KEY" \
      "$BASE_URL/api/v1/merchant/stock/$ITEM_SELLABLE"
 
 call "adjust units"                200 -X POST -H "X-Api-Key: $API_KEY" \
-     -H 'Content-Type: application/json' -d '{"delta":3,"operation_key":"smoke-1","reason":"delivery"}' \
+     -H 'Content-Type: application/json' \
+     -d "{\"delta\":3,\"operation_key\":\"$OP_KEY\",\"reason\":\"delivery\"}" \
      "$BASE_URL/api/v1/merchant/stock/$ITEM_SELLABLE/adjust"
 call "repeat the same operation"   200 -X POST -H "X-Api-Key: $API_KEY" \
-     -H 'Content-Type: application/json' -d '{"delta":3,"operation_key":"smoke-1","reason":"delivery"}' \
+     -H 'Content-Type: application/json' \
+     -d "{\"delta\":3,\"operation_key\":\"$OP_KEY\",\"reason\":\"delivery\"}" \
      "$BASE_URL/api/v1/merchant/stock/$ITEM_SELLABLE/adjust"
 if [ "$(json "['duplicate']")" != "True" ] || [ "$(json "['on_hand_qty']")" != "15" ]; then
   echo "FAIL the repeated adjustment was applied twice"; failures=$((failures + 1))
@@ -71,7 +78,8 @@ else
   printf 'OK   %-46s %s\n' "adjustment applied exactly once" "15 units"
 fi
 call "write off more than present" 409 -X POST -H "X-Api-Key: $API_KEY" \
-     -H 'Content-Type: application/json' -d '{"delta":-999,"operation_key":"smoke-2"}' \
+     -H 'Content-Type: application/json' \
+     -d "{\"delta\":-999,\"operation_key\":\"$OP_KEY-writeoff\"}" \
      "$BASE_URL/api/v1/merchant/stock/$ITEM_SELLABLE/adjust"
 
 call "stop sales"                  200 -X PATCH -H "X-Api-Key: $API_KEY" \
