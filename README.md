@@ -70,7 +70,7 @@ CJM покупателя и заведения — [`docs/cjm/`](docs/cjm/).
 раздел «Требования окружения».
 
 ```bash
-git clone <repo> && cd avito-kitchen
+git clone https://github.com/WlcM111/avito_test_backend.git && cd avito_test_backend
 cp .env.example .env   # необязательно: у всех переменных есть значения по умолчанию
 make up                # docker compose up --build -d
 make wait              # ждёт /readyz всех пяти сервисов
