@@ -1,6 +1,8 @@
 package httpapi_test
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -55,13 +57,21 @@ func decodeError(t *testing.T, body io.Reader) struct {
 	return out
 }
 
-func do(t *testing.T, srv *httptest.Server, method, path, body string, headers map[string]string) *http.Response {
+// response is an answer read in full: do drains and closes the body itself,
+// so a test never keeps a connection open and has nothing left to close.
+type response struct {
+	StatusCode int
+	Header     http.Header
+	Body       *bytes.Reader
+}
+
+func do(t *testing.T, srv *httptest.Server, method, path, body string, headers map[string]string) response {
 	t.Helper()
 	var reader io.Reader
 	if body != "" {
 		reader = strings.NewReader(body)
 	}
-	req, err := http.NewRequest(method, srv.URL+path, reader)
+	req, err := http.NewRequestWithContext(context.Background(), method, srv.URL+path, reader)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
@@ -75,8 +85,12 @@ func do(t *testing.T, srv *httptest.Server, method, path, body string, headers m
 	if err != nil {
 		t.Fatalf("do request: %v", err)
 	}
-	t.Cleanup(func() { _ = resp.Body.Close() })
-	return resp
+	defer func() { _ = resp.Body.Close() }()
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return response{StatusCode: resp.StatusCode, Header: resp.Header, Body: bytes.NewReader(payload)}
 }
 
 func TestListMerchants(t *testing.T) {

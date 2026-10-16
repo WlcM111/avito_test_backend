@@ -275,6 +275,23 @@ func TestQuoteItemsReportsAnOutage(t *testing.T) {
 	}
 }
 
+// A request the catalogue calls malformed is our defect: retrying it cannot
+// help, so it must not be reported as an outage (503).
+func TestQuoteItemsReportsAMalformedRequestAsOurDefect(t *testing.T) {
+	t.Parallel()
+	stub := &catalogServer{err: status.Error(codes.InvalidArgument, "too many ids")}
+	conn := dial(t, func(s *grpc.Server) { catalogv1.RegisterCatalogServiceServer(s, stub) })
+	catalogue := grpcclient.NewMenuCatalogue(conn, time.Second)
+
+	_, err := catalogue.QuoteItems(testCtx(t), merchantID, []uuid.UUID{itemA})
+	if !errors.Is(err, app.ErrInvalidRequest) {
+		t.Fatalf("QuoteItems() = %v, want ErrInvalidRequest", err)
+	}
+	if errors.Is(err, app.ErrDependencyUnavailable) {
+		t.Fatal("a malformed request must not be reported as an outage")
+	}
+}
+
 // ------------------------------------------------------------ inventory
 
 func TestGetAvailabilityMapsTheStopList(t *testing.T) {
@@ -368,6 +385,27 @@ func TestReserveWithoutDetailIsStillARejection(t *testing.T) {
 	}
 	if errors.Is(err, app.ErrDependencyUnavailable) {
 		t.Fatal("a refusal must not be reported as an outage")
+	}
+}
+
+// A hold refused as malformed is neither a refusal of the basket nor an
+// outage: it is our defect and must not be reported as a retryable 503.
+func TestReserveReportsAMalformedRequestAsOurDefect(t *testing.T) {
+	t.Parallel()
+	stub := &inventoryServer{reserveErr: status.Error(codes.InvalidArgument, "ttl above the maximum")}
+	conn := dial(t, func(s *grpc.Server) { inventoryv1.RegisterInventoryServiceServer(s, stub) })
+	ledger := grpcclient.NewStockLedger(conn, time.Second, time.Second, time.Second)
+
+	_, err := ledger.Reserve(testCtx(t), uuid.New(), merchantID,
+		[]domain.Line{{MenuItemID: itemA, Qty: 1}}, time.Minute)
+	if !errors.Is(err, app.ErrInvalidRequest) {
+		t.Fatalf("Reserve() = %v, want ErrInvalidRequest", err)
+	}
+	if errors.Is(err, app.ErrDependencyUnavailable) {
+		t.Fatal("a malformed request must not be reported as an outage")
+	}
+	if _, ok := app.AsReserveRejected(err); ok {
+		t.Fatal("a malformed request must not be reported as a refused basket")
 	}
 }
 

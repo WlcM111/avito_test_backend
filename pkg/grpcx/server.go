@@ -80,7 +80,8 @@ func (s *Server) SetServing(service string, serving bool) {
 
 // Serve listens until ctx is cancelled, then stops gracefully within grace.
 func (s *Server) Serve(ctx context.Context, grace time.Duration) error {
-	lis, err := net.Listen("tcp", s.addr)
+	var lc net.ListenConfig
+	lis, err := lc.Listen(ctx, "tcp", s.addr)
 	if err != nil {
 		return err
 	}
@@ -166,10 +167,10 @@ func loggingInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
 			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
 		}
 		l := logx.From(ctx, logger)
-		switch {
-		case code == codes.OK:
+		switch code {
+		case codes.OK:
 			l.Info("grpc request", attrs...)
-		case code == codes.Internal || code == codes.Unknown:
+		case codes.Internal, codes.Unknown:
 			l.Error("grpc request failed", append(attrs, slog.Any("error", err))...)
 		default:
 			l.Warn("grpc request rejected", attrs...)

@@ -6,9 +6,22 @@ GO             ?= go
 SERVICE        ?= merchant
 TEST_DATABASE_URL ?= postgres://postgres:postgres@127.0.0.1:5499/postgres?sslmode=disable
 
+# The stack started by `make up`, as its ports are published on the host
+# (defaults of docker-compose.yml and .env.example). Override them when the
+# ports in .env differ, e.g. `make e2e E2E_ORDER_URL=http://localhost:18084`.
+E2E_MERCHANT_URL  ?= http://localhost:8081
+E2E_CATALOG_URL   ?= http://localhost:8082
+E2E_INVENTORY_URL ?= http://localhost:8083
+E2E_ORDER_URL     ?= http://localhost:8084
+E2E_POS_URL       ?= http://localhost:8085
+# Ops listeners (/readyz) of merchant, inventory, catalog, order and partner-pos.
+OPS_PORTS         ?= 9091 9093 9092 9094 9095
+# How long `make wait` waits for each service, in seconds.
+WAIT_TIMEOUT      ?= 180
+
 .PHONY: help
 help: ## Show the available targets
-	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | \
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  %-22s %s\n", $$1, $$2}'
 
 .PHONY: deps
@@ -54,7 +67,7 @@ test-race: ## Run the full suite under the race detector
 	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" $(GO) test -race -count=1 ./...
 
 .PHONY: check
-check: fmt-check vet lint verify test-race ## Everything CI runs
+check: fmt-check vet lint verify test-race ## What the CI jobs build-and-test and lint check
 
 .PHONY: generate
 generate: ## Regenerate the gRPC stubs from api/proto
@@ -70,8 +83,23 @@ migrate: ## Apply the migrations of $(SERVICE) to $(DATABASE_URL)
 	MIGRATE_SERVICE=$(SERVICE) $(GO) run ./cmd/migrate
 
 .PHONY: up
-up: ## Start the local environment
+up: ## Build and start the whole stack in the background
 	docker compose up --build -d
+
+.PHONY: wait
+wait: ## Wait until every service of the running stack reports ready
+	@for port in $(OPS_PORTS); do \
+		printf 'waiting for http://localhost:%s/readyz ... ' "$$port"; \
+		elapsed=0; \
+		until curl -fs -m 5 -o /dev/null "http://localhost:$$port/readyz"; do \
+			if [ "$$elapsed" -ge "$(WAIT_TIMEOUT)" ]; then \
+				echo "not ready after $(WAIT_TIMEOUT)s, see: docker compose ps; docker compose logs"; \
+				exit 1; \
+			fi; \
+			sleep 2; elapsed=$$((elapsed + 2)); \
+		done; \
+		echo ready; \
+	done
 
 .PHONY: down
 down: ## Stop the local environment and drop its data
@@ -88,3 +116,12 @@ smoke: ## Call the running API and print the results
 	./scripts/smoke-catalog.sh
 	./scripts/smoke-order.sh
 	./scripts/smoke-pos.sh
+
+.PHONY: e2e
+e2e: ## Run the end-to-end tests against the running stack
+	E2E_MERCHANT_URL="$(E2E_MERCHANT_URL)" E2E_CATALOG_URL="$(E2E_CATALOG_URL)" \
+	E2E_INVENTORY_URL="$(E2E_INVENTORY_URL)" E2E_ORDER_URL="$(E2E_ORDER_URL)" \
+	E2E_POS_URL="$(E2E_POS_URL)" $(GO) test -count=1 -v ./test/e2e/...
+
+.PHONY: stack-check
+stack-check: up wait smoke e2e ## Start the stack, wait for it, run the smoke scripts and the end-to-end tests

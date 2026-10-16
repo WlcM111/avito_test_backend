@@ -32,15 +32,17 @@ func NewMerchantRepository(tx *pgxx.TxManager) *MerchantRepository {
 // List returns one page of the public merchant list and the total number of
 // matches. Only ACTIVE merchants are public. The total is taken with a window
 // function so that the page and the count come from a single round trip and a
-// single snapshot.
+// single snapshot. A page past the end has no rows to carry that count, so it
+// is counted separately: the client still needs the total to page back.
 func (r *MerchantRepository) List(ctx context.Context, f domain.ListFilter) ([]domain.Merchant, int, error) {
-	const q = `
-SELECT ` + merchantColumns + `, count(*) OVER () AS total_count
+	const filter = `
 FROM merchants
 WHERE status = 'ACTIVE'
   AND ($1 = '' OR city = $1)
   AND ($2 = '' OR name ILIKE '%' || $2 || '%' OR cuisine ILIKE '%' || $2 || '%')
-  AND (NOT $3::boolean OR is_accepting_orders)
+  AND (NOT $3::boolean OR is_accepting_orders)`
+	const q = `
+SELECT ` + merchantColumns + `, count(*) OVER () AS total_count` + filter + `
 ORDER BY name, id
 LIMIT $4 OFFSET $5`
 
@@ -67,6 +69,12 @@ LIMIT $4 OFFSET $5`
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("iterate merchants: %w", err)
+	}
+	if len(items) == 0 && f.Offset > 0 {
+		if err := r.tx.Querier(ctx).QueryRow(ctx, `SELECT count(*)`+filter,
+			f.City, f.Query, f.OnlyAccepting).Scan(&total); err != nil {
+			return nil, 0, fmt.Errorf("count merchants: %w", err)
+		}
 	}
 	return items, total, nil
 }

@@ -59,26 +59,32 @@ func RequestID() Middleware {
 	}
 }
 
-// Recover turns a panic into a 500 response and logs it with the stack.
+// Recover turns a panic into a 500 response and logs the panic value.
 func Recover(logger *slog.Logger) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			defer func() {
-				if rec := recover(); rec != nil {
-					logx.From(r.Context(), logger).Error("panic in handler",
-						slog.Any("panic", rec), slog.String("path", r.URL.Path))
-					WriteJSON(w, r, http.StatusInternalServerError, errorEnvelope{
-						Error: errorBody{
-							Code:      CodeInternal,
-							Message:   "internal error",
-							RequestID: logx.RequestID(r.Context()),
-						},
-					})
-				}
-			}()
+			defer recoverPanic(w, r, logger)
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// recoverPanic is deferred by Recover. It must stay the deferred function
+// itself: recover stops a panic only when called directly from it.
+func recoverPanic(w http.ResponseWriter, r *http.Request, logger *slog.Logger) {
+	rec := recover()
+	if rec == nil {
+		return
+	}
+	logx.From(r.Context(), logger).Error("panic in handler",
+		slog.Any("panic", rec), slog.String("path", r.URL.Path))
+	WriteJSON(w, r, http.StatusInternalServerError, errorEnvelope{
+		Error: errorBody{
+			Code:      CodeInternal,
+			Message:   "internal error",
+			RequestID: logx.RequestID(r.Context()),
+		},
+	})
 }
 
 // AccessLog records one structured line per request.

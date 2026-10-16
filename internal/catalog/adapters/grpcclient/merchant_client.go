@@ -53,9 +53,9 @@ func (d *MerchantDirectory) Authenticate(ctx context.Context, apiKey string) (ap
 			if errors.Is(ctx.Err(), context.Canceled) {
 				return app.MerchantIdentity{}, ctx.Err()
 			}
-			return app.MerchantIdentity{}, fmt.Errorf("%w: %v", app.ErrMerchantDirectoryUnavailable, err)
+			return app.MerchantIdentity{}, fmt.Errorf("%w: %w", app.ErrMerchantDirectoryUnavailable, err)
 		default:
-			return app.MerchantIdentity{}, fmt.Errorf("%w: %v", app.ErrMerchantDirectoryUnavailable, err)
+			return app.MerchantIdentity{}, fmt.Errorf("%w: %w", app.ErrMerchantDirectoryUnavailable, err)
 		}
 	}
 

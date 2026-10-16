@@ -29,22 +29,21 @@ type OpsHandler struct {
 func NewOpsHandler(ready ReadinessCheck, checkTimeout time.Duration) *OpsHandler {
 	h := &OpsHandler{mux: http.NewServeMux()}
 	h.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeOps(w, http.StatusOK, map[string]string{"status": "ok"})
+		writeOps(w, http.StatusOK, opsStatus{Status: "ok"})
 	})
 	h.mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		if h.shuttingDown.Load() {
-			writeOps(w, http.StatusServiceUnavailable,
-				map[string]string{"status": "shutting_down"})
+			writeOps(w, http.StatusServiceUnavailable, opsStatus{Status: "shutting_down"})
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), checkTimeout)
 		defer cancel()
 		if err := ready(ctx); err != nil {
 			writeOps(w, http.StatusServiceUnavailable,
-				map[string]string{"status": "not_ready", "reason": err.Error()})
+				opsStatus{Status: "not_ready", Reason: err.Error()})
 			return
 		}
-		writeOps(w, http.StatusOK, map[string]string{"status": "ready"})
+		writeOps(w, http.StatusOK, opsStatus{Status: "ready"})
 	})
 	return h
 }
@@ -55,7 +54,13 @@ func (h *OpsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { h.mux.S
 // BeginShutdown makes /readyz report 503 before the listeners stop.
 func (h *OpsHandler) BeginShutdown() { h.shuttingDown.Store(true) }
 
-func writeOps(w http.ResponseWriter, status int, body map[string]string) {
+// opsStatus is the body of both probes.
+type opsStatus struct {
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
+func writeOps(w http.ResponseWriter, status int, body opsStatus) {
 	w.Header().Set("Content-Type", contentTypeJSON)
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)

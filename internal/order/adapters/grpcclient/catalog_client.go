@@ -47,7 +47,7 @@ func (c *MenuCatalogue) QuoteItems(ctx context.Context, merchantID uuid.UUID,
 		if status.Code(err) == codes.InvalidArgument {
 			// The catalogue considers our request malformed. That is our bug,
 			// not an outage, and it must not be reported as a retryable 503.
-			return app.Quote{}, app.Unavailable(depCatalog, err)
+			return app.Quote{}, invalidRequest(depCatalog, err)
 		}
 		return app.Quote{}, dependencyError(ctx, depCatalog, err)
 	}

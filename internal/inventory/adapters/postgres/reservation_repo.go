@@ -77,6 +77,7 @@ WHERE merchant_id = $1 AND menu_item_id = $2
   AND on_hand_qty - reserved_qty >= $3
 RETURNING ` + stockColumns
 
+		held := make(map[uuid.UUID]int32, len(req.Lines))
 		for _, line := range req.Lines {
 			item, err := scanStockRow(r.tx.Querier(ctx).QueryRow(ctx, hold,
 				req.MerchantID, line.MenuItemID, line.Qty))
@@ -84,7 +85,7 @@ RETURNING ` + stockColumns
 				// Nothing was held for this line. Build the full picture for
 				// every requested line, then abort: the caller needs to see
 				// all problems at once, not only the first one.
-				results, diagErr := r.diagnose(ctx, req)
+				results, diagErr := r.diagnose(ctx, req, held)
 				if diagErr != nil {
 					return diagErr
 				}
@@ -119,6 +120,7 @@ VALUES ($1, $2, $3, $4)`
 				MenuItemID:  line.MenuItemID,
 				Qty:         line.Qty,
 			})
+			held[line.MenuItemID] += line.Qty
 		}
 
 		out = app.ReserveOutcome{Reservation: reservation}
@@ -132,8 +134,11 @@ VALUES ($1, $2, $3, $4)`
 
 // diagnose reports the state of every requested line. It runs inside the
 // failing transaction, so the numbers it returns are the ones the conditional
-// UPDATE saw.
-func (r *ReservationRepository) diagnose(ctx context.Context, req domain.ReserveRequest) ([]domain.LineResult, error) {
+// UPDATE saw. The lines this transaction has already held are counted back:
+// the transaction is about to be rolled back, and reporting them as short of
+// units would blame positions that can in fact be ordered.
+func (r *ReservationRepository) diagnose(ctx context.Context, req domain.ReserveRequest,
+	held map[uuid.UUID]int32) ([]domain.LineResult, error) {
 	ids := make([]uuid.UUID, 0, len(req.Lines))
 	for _, l := range req.Lines {
 		ids = append(ids, l.MenuItemID)
@@ -158,6 +163,7 @@ func (r *ReservationRepository) diagnose(ctx context.Context, req domain.Reserve
 			})
 			continue
 		}
+		item.ReservedQty -= held[l.MenuItemID]
 		results = append(results, domain.LineResult{
 			MenuItemID:   l.MenuItemID,
 			RequestedQty: l.Qty,

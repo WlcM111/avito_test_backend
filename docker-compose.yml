@@ -42,10 +42,15 @@ services:
       # Compose сервисы по-прежнему ходят на postgres:5432.
       - "${POSTGRES_PORT:-5499}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d postgres"]
+      # Проверка идёт по TCP, а не через unix-сокет. При первом запуске образ
+      # выполняет init-скрипты на временном сервере, который слушает только
+      # сокет; проверка через сокет сообщала бы «healthy» уже тогда, и job
+      # миграций получил бы connection refused по сети Compose.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U ${POSTGRES_USER:-postgres} -d postgres"]
       interval: 3s
       timeout: 3s
       retries: 20
+      start_period: 10s
 
   merchant-migrate:
     build:

@@ -106,7 +106,9 @@ func (l *StockLedger) Reserve(ctx context.Context, reservationID, merchantID uui
 			return app.ReserveResult{}, rejection
 		}
 		if status.Code(err) == codes.InvalidArgument {
-			return app.ReserveResult{}, app.Unavailable(depInventory, err)
+			// Our request is malformed: a defect on our side, not an outage
+			// and not a refusal of the basket, so it must not become 503.
+			return app.ReserveResult{}, invalidRequest(depInventory, err)
 		}
 		return app.ReserveResult{}, dependencyError(ctx, depInventory, err)
 	}

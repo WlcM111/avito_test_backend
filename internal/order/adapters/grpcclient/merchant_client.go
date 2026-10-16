@@ -121,6 +121,13 @@ func (d *MerchantDirectory) GetMerchant(ctx context.Context, merchantID uuid.UUI
 	}, nil
 }
 
+// invalidRequest reports that a dependency refused our message as malformed.
+// Retrying the same message cannot succeed, so it is kept apart from an
+// outage: the transport answers it with 500, not with a retryable 503.
+func invalidRequest(dependency string, err error) error {
+	return fmt.Errorf("%w: %s: %w", app.ErrInvalidRequest, dependency, err)
+}
+
 // dependencyError distinguishes our own cancellation from an outage of the
 // dependency: a client that walked away is not an incident.
 func dependencyError(ctx context.Context, dependency string, err error) error {

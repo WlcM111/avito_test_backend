@@ -19,6 +19,17 @@ CUSTOMER_ID="${CUSTOMER_ID:-$(python3 -c 'import uuid;print(uuid.uuid4())')}"
 
 failures=0
 
+# Касса возвращается в ручной режим при любом выходе — и после провалившейся
+# проверки, и при обрыве скрипта (set -e, Ctrl+C): в автоматическом режиме она
+# отвечала бы на заказы smoke-order и сквозных тестов и делала бы их
+# недетерминированными.
+restore_manual_mode() {
+  curl -s -o /dev/null -X PUT -H 'Content-Type: application/json' \
+    -d '{"mode":"MANUAL","eta_minutes":25,"reject_reason":"закончились продукты","kitchen":true}' \
+    "$BASE_URL/pos/behavior" || true
+}
+trap restore_manual_mode EXIT
+
 call() {
   local name="$1" expected="$2"; shift 2
   local code
@@ -68,6 +79,13 @@ call "readiness"                    200 "$OPS_URL/readyz"
 call "till menu"                    200 "$BASE_URL/pos/menu"
 check "three seeded positions"      "$(json "['items'].__len__()")" "3"
 check "currency"                    "$(json "['currency']")" "RUB"
+
+# Касса держит меню в памяти, поэтому прошлый прогон этого скрипта или ручной
+# эксперимент мог оставить у POS-001 другие цену, количество и стоп-лист.
+# Сценарий начинается с демонстрационных значений: проверка «units pushed by
+# the till» ниже сравнивает остаток платформы именно с ними.
+call "reset the till position"      200 -X PATCH -H 'Content-Type: application/json' \
+     -d '{"price_minor":42000,"on_hand_qty":10,"sales_stopped":false}' "$BASE_URL/pos/menu/POS-001"
 
 call "publish the menu"             200 -X POST "$BASE_URL/pos/publish"
 check "every position matched"      "$(json "['matched']")" "3"

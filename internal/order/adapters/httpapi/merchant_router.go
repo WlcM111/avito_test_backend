@@ -59,9 +59,10 @@ func (h *Handler) merchantContext(r *http.Request) (uuid.UUID, uuid.UUID, error)
 	return identity.MerchantID, orderID, nil
 }
 
-// listMerchantOrders serves the queue the outlet polls. The default view is
-// the work that still needs a decision or a move; an explicit status filter
-// overrides it.
+// listMerchantOrders serves the queue the outlet polls. Without a status
+// filter every status is listed, as api/openapi/order.v1.yaml specifies; a
+// till that only wants the work still needing a decision or a move asks for
+// those statuses explicitly.
 func (h *Handler) listMerchantOrders(w http.ResponseWriter, r *http.Request) error {
 	identity, ok := merchantFromContext(r.Context())
 	if !ok {

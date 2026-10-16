@@ -2,10 +2,13 @@
 // PostgreSQL. It owns the SQL and translates storage failures into domain
 // errors; it contains no business rules.
 //
-// Every quantity change is expressed as a single conditional UPDATE so that
-// PostgreSQL locks the row and re-checks the condition itself. That is what
-// makes the accounting correct under concurrency without an explicit lock and
-// without an isolation level above READ COMMITTED.
+// Holds, commits and releases are single conditional UPDATEs that change the
+// counters relatively, so PostgreSQL locks the row and re-checks the condition
+// itself. The merchant operations - SetOnHand, AdjustOnHand and SetSalesState -
+// compute the new state from the card they have read, so they lock the card
+// with SELECT ... FOR UPDATE first: otherwise a concurrent adjustment, hold or
+// commit landing between the read and the write would be overwritten. Both
+// keep the accounting correct under concurrency at READ COMMITTED.
 package postgres
 
 import (
@@ -48,8 +51,9 @@ FROM stock_items WHERE merchant_id = $1 AND menu_item_id = $2`
 	return item, nil
 }
 
-// List returns one page of the merchant's cards with the total count taken in
-// the same snapshot.
+// List returns one page of the merchant's cards with the total count. The
+// total rides on the page as a window count; a page past the end has no rows
+// to carry it, so it is counted separately.
 func (r *StockRepository) List(ctx context.Context, merchantID uuid.UUID,
 	limit, offset int) ([]domain.StockItem, int, error) {
 	const q = `SELECT ` + stockColumns + `, count(*) OVER () AS total_count
@@ -80,6 +84,13 @@ LIMIT $2 OFFSET $3`
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("iterate stock items: %w", err)
+	}
+	if len(items) == 0 && offset > 0 {
+		if err := r.tx.Querier(ctx).QueryRow(ctx,
+			`SELECT count(*) FROM stock_items WHERE merchant_id = $1`,
+			merchantID).Scan(&total); err != nil {
+			return nil, 0, fmt.Errorf("count stock items: %w", err)
+		}
 	}
 	return items, total, nil
 }
@@ -113,17 +124,32 @@ FROM stock_items WHERE merchant_id = $1 AND menu_item_id = ANY($2)`
 	return items, nil
 }
 
-// ensureCard creates the card if it is absent and returns its current state.
-// A new card starts at zero units and ENABLED: creating it confirms nothing.
+// ensureCard creates the card if it is absent and returns its current state,
+// locked until the end of the transaction. A new card starts at zero units and
+// ENABLED: creating it confirms nothing.
+//
+// The lock is what makes the read-modify-write of the merchant operations
+// safe: a concurrent change of the same card waits for this transaction
+// instead of being overwritten by a value computed from a stale read.
 func (r *StockRepository) ensureCard(ctx context.Context, merchantID, menuItemID uuid.UUID) (domain.StockItem, error) {
-	const q = `
+	const insert = `
 INSERT INTO stock_items (id, merchant_id, menu_item_id, sales_state, on_hand_qty, reserved_qty)
 VALUES ($1, $2, $3, 'ENABLED', 0, 0)
 ON CONFLICT (merchant_id, menu_item_id) DO NOTHING`
-	if _, err := r.tx.Querier(ctx).Exec(ctx, q, uuid.New(), merchantID, menuItemID); err != nil {
+	if _, err := r.tx.Querier(ctx).Exec(ctx, insert, uuid.New(), merchantID, menuItemID); err != nil {
 		return domain.StockItem{}, fmt.Errorf("create stock item: %w", err)
 	}
-	return r.Get(ctx, merchantID, menuItemID)
+	const lock = `SELECT ` + stockColumns + `
+FROM stock_items WHERE merchant_id = $1 AND menu_item_id = $2
+FOR UPDATE`
+	item, err := scanStockRow(r.tx.Querier(ctx).QueryRow(ctx, lock, merchantID, menuItemID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StockItem{}, domain.ErrStockItemNotFound
+	}
+	if err != nil {
+		return domain.StockItem{}, fmt.Errorf("lock stock item: %w", err)
+	}
+	return item, nil
 }
 
 // SetOnHand stores an absolute on-hand value in one transaction together with
@@ -155,8 +181,9 @@ RETURNING ` + stockColumns
 		updated, err := scanStockRow(r.tx.Querier(ctx).QueryRow(ctx, q,
 			merchantID, menuItemID, qty, expectedVersion))
 		if errors.Is(err, pgx.ErrNoRows) {
-			// The row changed between the read and the write: re-read to tell
-			// a stale version apart from a concurrent reservation.
+			// Defensive only: ensureCard holds the row lock, so the checks
+			// above saw the state the UPDATE sees. Re-read to report the
+			// precise reason should the two ever disagree.
 			latest, getErr := r.Get(ctx, merchantID, menuItemID)
 			if getErr != nil {
 				return getErr
@@ -200,8 +227,9 @@ type adjustResult struct {
 // AdjustOnHand applies a relative change exactly once per operation key.
 // A relative change is not idempotent by nature, so the key is inserted in the
 // same transaction as the change: a repeat hits the primary key of
-// stock_operations, the transaction is abandoned and the stored result is
-// returned unchanged (INV-S7).
+// stock_operations, changes nothing and reports duplicate together with the
+// current card (INV-S7). The outcome of the first application stays in
+// stock_operations.result as the audit record of that key.
 func (r *StockRepository) AdjustOnHand(ctx context.Context, merchantID, menuItemID uuid.UUID,
 	delta int32, operationKey, reason string) (domain.StockItem, bool, error) {
 	var (
@@ -364,6 +392,14 @@ LIMIT $2 OFFSET $3`
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("iterate movements: %w", err)
+	}
+	if len(items) == 0 && offset > 0 {
+		// A page past the end has no rows to carry the window count.
+		if err := r.tx.Querier(ctx).QueryRow(ctx,
+			`SELECT count(*) FROM stock_movements WHERE stock_item_id = $1`,
+			item.ID).Scan(&total); err != nil {
+			return nil, 0, fmt.Errorf("count movements: %w", err)
+		}
 	}
 	return items, total, nil
 }

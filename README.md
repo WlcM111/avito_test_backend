@@ -66,18 +66,31 @@ CJM покупателя и заведения — [`docs/cjm/`](docs/cjm/).
 
 ## Быстрый старт
 
+Нужны Docker с плагином Compose v2, `make`, `curl` и `python3`; полный список —
+раздел «Требования окружения».
+
 ```bash
 git clone <repo> && cd avito-kitchen
-cp .env.example .env
-docker compose up --build
+cp .env.example .env   # необязательно: у всех переменных есть значения по умолчанию
+make up                # docker compose up --build -d
+make wait              # ждёт /readyz всех пяти сервисов
 ```
+
+Без `make` — `docker compose up --build -d` и `docker compose ps -a`: стенд
+готов, когда пять сервисов в состоянии `healthy`, а четыре job миграций
+завершились с кодом 0.
 
 Порядок готовности: PostgreSQL → job миграций (`merchant-migrate`,
 `inventory-migrate`, `catalog-migrate`, `order-migrate`) → `merchant-service` →
 `inventory-service` и `catalog-service` → `order-service` → `partner-pos`.
 Публичные API: `http://localhost:8081` (заведения), `http://localhost:8082`
 (меню), `http://localhost:8083` (поштучные остатки), `http://localhost:8084`
-(заказы) и `http://localhost:8085` (управление кассой заведения).
+(заказы) и `http://localhost:8085` (управление кассой заведения). Служебные
+`/healthz` и `/readyz` — на портах 9091 (merchant), 9092 (catalog),
+9093 (inventory), 9094 (order) и 9095 (partner-pos).
+
+Проверка всего решения одной командой — `make stack-check` (раздел «Проверка
+решения»). Остановка с удалением данных — `make down` (`docker compose down -v`).
 
 Касса при старте публикует своё меню и выставляет остатки. В очередь заказов
 она по умолчанию не вмешивается: режим `MANUAL`. Чтобы увидеть автоматический
@@ -87,9 +100,20 @@ docker compose up --build
 curl -s -X PUT -H 'Content-Type: application/json' \
      -d '{"mode":"AUTO_ACCEPT","eta_minutes":25,"reject_reason":"нет","kitchen":true}' \
      localhost:8085/pos/behavior
+
+# вернуть ручной режим: в автоматическом касса сама отвечает на все заказы
+# заведения, в том числе на заказы примеров ниже и smoke-проверок
+curl -s -X PUT -H 'Content-Type: application/json' \
+     -d '{"mode":"MANUAL","eta_minutes":25,"reject_reason":"закончились продукты","kitchen":true}' \
+     localhost:8085/pos/behavior
 ```
 
-Проверка:
+Примеры ниже выполняются по порядку на поднятом стенде. За командами, которые
+закрывают заведение, ставят позицию в стоп-лист, публикуют урезанное меню или
+переключают кассу в автоматический режим, следует команда, возвращающая
+прежнее состояние: на нём держатся smoke-проверки.
+
+Заведения:
 
 ```bash
 curl -s localhost:8081/api/v1/merchants | head -c 400
@@ -97,9 +121,16 @@ curl -s localhost:8081/api/v1/merchants | head -c 400
 curl -s -H 'X-Api-Key: dev-merchant-key-kafe-primer-0001' \
      localhost:8081/api/v1/merchant/profile
 
+# закрыть приём заказов и поднять минимальную сумму
 curl -s -X PATCH -H 'X-Api-Key: dev-merchant-key-kafe-primer-0001' \
      -H 'Content-Type: application/json' \
      -d '{"is_accepting_orders":false,"min_order_minor":70000}' \
+     localhost:8081/api/v1/merchant/profile
+
+# вернуть значения seed
+curl -s -X PATCH -H 'X-Api-Key: dev-merchant-key-kafe-primer-0001' \
+     -H 'Content-Type: application/json' \
+     -d '{"is_accepting_orders":true,"min_order_minor":50000}' \
      localhost:8081/api/v1/merchant/profile
 ```
 
@@ -124,6 +155,11 @@ curl -s -X PATCH -H 'X-Api-Key: dev-merchant-key-kafe-primer-0001' \
      -H 'Content-Type: application/json' -d '{"sales_state":"STOPPED"}' \
      localhost:8083/api/v1/merchant/stock/a1111111-1111-4111-8111-111111111111
 
+# снять позицию со стоп-листа
+curl -s -X PATCH -H 'X-Api-Key: dev-merchant-key-kafe-primer-0001' \
+     -H 'Content-Type: application/json' -d '{"sales_state":"ENABLED"}' \
+     localhost:8083/api/v1/merchant/stock/a1111111-1111-4111-8111-111111111111
+
 # журнал движений
 curl -s -H 'X-Api-Key: dev-merchant-key-kafe-primer-0001' \
      localhost:8083/api/v1/merchant/stock/a1111111-1111-4111-8111-111111111111/movements
@@ -140,9 +176,13 @@ curl -si -H 'X-Api-Key: dev-merchant-key-kafe-primer-0001' \
      localhost:8082/api/v1/merchant/menu | head -20
 
 # публикация снимка целиком: отсутствующие позиции снимаются с продажи,
-# у оставшихся сохраняется menu_item_id
+# у оставшихся сохраняется menu_item_id. If-Match — текущая menu_version:
+# касса уже опубликовала меню при старте, поэтому версия больше 1
+VERSION=$(curl -s -H 'X-Api-Key: dev-merchant-key-kafe-primer-0001' \
+     localhost:8082/api/v1/merchant/menu |
+     python3 -c 'import json,sys; print(json.load(sys.stdin)["menu_version"])')
 curl -s -X PUT -H 'X-Api-Key: dev-merchant-key-kafe-primer-0001' \
-     -H 'Content-Type: application/json' -H 'If-Match: "1"' \
+     -H 'Content-Type: application/json' -H "If-Match: \"$VERSION\"" \
      -d '{"categories":[{"name":"Горячее","position":0,"items":[
            {"external_id":"POS-001","name":"Борщ с говядиной","price_minor":43000,"position":0}]}]}' \
      localhost:8082/api/v1/merchant/menu
@@ -151,6 +191,10 @@ curl -s -X PUT -H 'X-Api-Key: dev-merchant-key-kafe-primer-0001' \
 curl -s -X PATCH -H 'X-Api-Key: dev-merchant-key-kafe-primer-0001' \
      -H 'Content-Type: application/json' -d '{"price_minor":44500}' \
      localhost:8082/api/v1/merchant/menu/items/a1111111-1111-4111-8111-111111111111
+
+# вернуть меню и остатки кассы: она заново публикует все три позиции и
+# выставляет их количества и стоп-лист
+curl -s -X POST localhost:8085/pos/publish
 ```
 
 Меню и остатки ведутся по одним и тем же идентификаторам позиций, поэтому
@@ -160,52 +204,219 @@ curl -s -X PATCH -H 'X-Api-Key: dev-merchant-key-kafe-primer-0001' \
 Заказы — весь путь от корзины до доставки:
 
 ```bash
-CUSTOMER=$(uuidgen)
-ITEM=a1111111-1111-4111-8111-111111111111
-MERCHANT=11111111-1111-4111-8111-111111111111
-BASKET="{\"merchant_id\":\"$MERCHANT\",\"items\":[{\"menu_item_id\":\"$ITEM\",\"qty\":3}],
-         \"customer_name\":\"Иван\",\"customer_phone\":\"+79990000001\",
-         \"delivery_address\":\"Невский проспект, 1\"}"
+CUSTOMER=$(python3 -c 'import uuid; print(uuid.uuid4())')
+BASKET='"merchant_id":"11111111-1111-4111-8111-111111111111",
+        "items":[{"menu_item_id":"a1111111-1111-4111-8111-111111111111","qty":3}]'
+DELIVERY='"customer_name":"Иван","customer_phone":"+79990000001",
+          "delivery_address":"Невский проспект, 1"'
 
-# пересчёт корзины: цены из каталога, штуки из остатков, условия из профиля
-curl -s -H 'Content-Type: application/json' -d "$BASKET" \
+# пересчёт корзины: цены из каталога, штуки из остатков, условия из профиля;
+# тело — только merchant_id и items, неизвестные поля отвергаются (400)
+curl -s -H 'Content-Type: application/json' -d "{$BASKET}" \
      localhost:8084/api/v1/orders/preview
 
-# оформление: удерживает штуки; повтор с тем же ключом вернёт тот же заказ
+# оформление: удерживает штуки
 curl -s -X POST -H 'Content-Type: application/json' \
      -H "X-Customer-Id: $CUSTOMER" -H "Idempotency-Key: demo-$CUSTOMER" \
-     -d "$BASKET" localhost:8084/api/v1/orders
+     -d "{$BASKET,$DELIVERY}" localhost:8084/api/v1/orders
+
+# повтор с тем же ключом возвращает тот же заказ (Idempotent-Replay: true) и
+# ничего не удерживает повторно; из ответа берётся идентификатор заказа
+ORDER=$(curl -s -X POST -H 'Content-Type: application/json' \
+     -H "X-Customer-Id: $CUSTOMER" -H "Idempotency-Key: demo-$CUSTOMER" \
+     -d "{$BASKET,$DELIVERY}" localhost:8084/api/v1/orders |
+     python3 -c 'import json,sys; print(json.load(sys.stdin)["order_id"])')
 
 # очередь заведения и приём заказа (штуки спишутся через outbox)
 curl -s -H 'X-Api-Key: dev-merchant-key-kafe-primer-0001' \
      'localhost:8084/api/v1/merchant/orders?status=CREATED'
 curl -s -X POST -H 'X-Api-Key: dev-merchant-key-kafe-primer-0001' \
      -H 'Content-Type: application/json' -d '{"eta_minutes":25}' \
-     localhost:8084/api/v1/merchant/orders/<order_id>/accept
+     "localhost:8084/api/v1/merchant/orders/$ORDER/accept"
+
+# заказ глазами покупателя
+curl -s -H "X-Customer-Id: $CUSTOMER" "localhost:8084/api/v1/orders/$ORDER"
 ```
 
-Полные сценарии:
-`BASE_URL=http://localhost:8081 ./scripts/smoke.sh` (14 проверок),
-`BASE_URL=http://localhost:8083 ./scripts/smoke-inventory.sh` (22 проверки,
-включая 401, 404, 409, 412 и 422 и повтор неидемпотентной операции),
-`BASE_URL=http://localhost:8082 ./scripts/smoke-catalog.sh` (32 проверки,
-включая конфликт версии, снятие позиций с продажи и стабильность
-идентификаторов) и `BASE_URL=http://localhost:8084 ./scripts/smoke-order.sh`
-(57 проверок: весь жизненный цикл заказа, идемпотентность, конфликты статусов,
-возврат и списание штук) и
-`BASE_URL=http://localhost:8085 ./scripts/smoke-pos.sh` (публикация меню
-кассой, синхронизация остатков, автоматический отказ и автоматический приём с
-доведением заказа до `DELIVERED`).
+## Проверка решения
 
-Сквозные тесты против запущенного стека:
+Всё решение проверяется одной командой против стенда из `docker-compose.yml`:
+
+```bash
+make stack-check   # make up wait smoke e2e
+make down          # остановить стенд и удалить данные
+```
+
+`make stack-check` собирает образы и поднимает стенд, ждёт готовности всех пяти
+сервисов, прогоняет smoke-сценарии и сквозные тесты; первая же неудача
+завершает команду с ненулевым кодом. На поднятом стенде шаги запускаются и по
+отдельности, сколько угодно раз:
+
+| Команда | Что делает |
+|---|---|
+| `make up` | `docker compose up --build -d`: образы, PostgreSQL, миграции, пять сервисов |
+| `make wait` | опрашивает `/readyz` на портах `OPS_PORTS` (по умолчанию `9091 9093 9092 9094 9095`), каждый не дольше `WAIT_TIMEOUT` секунд (180) |
+| `make smoke` | пять smoke-скриптов подряд, таблица ниже |
+| `make e2e` | `go test -count=1 -v ./test/e2e/...` с адресами стенда в `E2E_*_URL` |
+| `make test-race` | все unit- и интеграционные тесты под race-детектором; интеграционные — против PostgreSQL стенда на порту 5499 |
+| `make check` | `make fmt-check vet lint verify test-race` — локально то, что проверяют job `build-and-test` и `lint` в CI |
+
+Smoke-скрипт печатает по строке на проверку — `OK` или `FAIL` с телом ответа —
+и при любой неудаче завершается с кодом 1.
+
+| Скрипт | Сервис | Проверок | Что покрывает |
+|---|---|---|---|
+| `scripts/smoke.sh` | merchant-service, `:8081` | 14 | список и фильтр по городу, карточка, отключённое заведение (404), профиль по ключу (401 без ключа), `PATCH` с устаревшим `If-Match` (412), ошибки валидации (422) |
+| `scripts/smoke-inventory.sh` | inventory-service, `:8083` | 22 | 401, 404, 409, 412 и 422, повтор неидемпотентной операции |
+| `scripts/smoke-catalog.sh` | catalog-service, `:8082` | 32 | конфликт версии, снятие позиций с продажи, стабильность идентификаторов |
+| `scripts/smoke-order.sh` | order-service, `:8084` | 60 | весь жизненный цикл заказа, идемпотентность, конфликты статусов, возврат и списание штук |
+| `scripts/smoke-pos.sh` | partner-pos, `:8085` | 36 | публикация меню кассой, синхронизация остатков, автоматический отказ и автоматический приём с доведением заказа до `DELIVERED`; начинает с демонстрационных значений `POS-001` в кассе и при любом выходе возвращает ей режим `MANUAL` |
+
+Сквозные тесты (`test/e2e`) проходят путь покупателя и заведения через все
+сервисы и проверяют состояние, в котором оказывается каждый: оформление с
+удержанием штук и идемпотентный повтор, приём со списанием через outbox и
+доведение до `DELIVERED`, отмену и отказ с возвратом штук, отказ корзины из-за
+стоп-листа и нехватки штук, недоступность чужого заказа, обязательные
+заголовки, конверт ошибки на неизвестном пути и автоматические ответы кассы.
+Каждый тест сам приводит демонстрационное заведение в нужное состояние:
+профиль, остатки, режим кассы `MANUAL`, отказ по заказам, оставшимся без
+решения. Поэтому тесты повторяются на одном стенде и проходят после
+smoke-скриптов и ручных экспериментов.
+
+Без `make` сквозные тесты запускаются так:
 
 ```bash
 E2E_MERCHANT_URL=http://localhost:8081 E2E_CATALOG_URL=http://localhost:8082 \
 E2E_INVENTORY_URL=http://localhost:8083 E2E_ORDER_URL=http://localhost:8084 \
+E2E_POS_URL=http://localhost:8085 \
 go test ./test/e2e/... -count=1 -v
 ```
 
-Остановка: `docker compose down -v`.
+Без `E2E_POS_URL` пропускается только сценарий кассы; без любой из четырёх
+остальных переменных пропускаются все сквозные тесты, поэтому `go test ./...`
+работает и без стенда.
+
+Если порты в `.env` изменены, их нужно передать проверкам:
+`make wait OPS_PORTS="…"`, `make e2e E2E_ORDER_URL=http://localhost:18084`
+(так же остальные `E2E_*_URL`), а smoke-скрипты запускать по одному с
+`BASE_URL`, `OPS_URL` и адресами соседних сервисов (`INVENTORY_URL`,
+`CATALOG_URL`, `ORDER_URL`; переменные перечислены в начале каждого скрипта).
+
+CI (`.github/workflows/ci.yml`) выполняет три job: `build-and-test`
+(`make deps verify fmt-check build vet test-race` против PostgreSQL 18),
+`lint` (golangci-lint v2.14.0, который сначала проверяет `.golangci.yml` по
+схеме) и `e2e` (`make up wait smoke e2e` на стенде Docker Compose; при неудаче
+печатает логи стенда).
+
+## Переменные окружения
+
+### `.env` для Docker Compose
+
+Файл необязателен: `docker-compose.yml` задаёт каждой переменной значение по
+умолчанию, `.env.example` повторяет их.
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `LOG_LEVEL` | `info` | Уровень логов сервисов и job миграций |
+| `POSTGRES_USER`, `POSTGRES_PASSWORD` | `postgres`, `postgres` | Суперпользователь PostgreSQL; с ним работают интеграционные тесты |
+| `POSTGRES_PORT` | `5499` | Порт PostgreSQL на хосте |
+| `MERCHANT_SVC_PASSWORD`, `MERCHANT_MIGRATOR_PASSWORD`, так же `INVENTORY_*`, `CATALOG_*`, `ORDERS_*` | имя роли: `merchant_svc`, `merchant_migrator`, … | Пароли ролей сервиса и миграций. Роли получают их при первой инициализации тома (`deploy/postgres/init/02-role-passwords.sh`), поэтому после смены нужны `make down` и `make up` |
+| `MERCHANT_HTTP_PORT`, `CATALOG_HTTP_PORT`, `INVENTORY_HTTP_PORT`, `ORDER_HTTP_PORT`, `POS_HTTP_PORT` | `8081`, `8082`, `8083`, `8084`, `8085` | Публичные HTTP-порты на хосте |
+| `MERCHANT_OPS_PORT`, `CATALOG_OPS_PORT`, `INVENTORY_OPS_PORT`, `ORDER_OPS_PORT`, `POS_OPS_PORT` | `9091`, `9092`, `9093`, `9094`, `9095` | Порты `/healthz` и `/readyz` на хосте |
+| `RESERVATION_DEFAULT_TTL`, `SWEEPER_INTERVAL` | `30m`, `1m` | Передаются `inventory-service` |
+| `CATALOG_MAX_BODY_BYTES` | `1048576` | `HTTP_MAX_BODY_BYTES` для `catalog-service` |
+| `RESERVATION_TTL`, `OUTBOX_INTERVAL`, `OUTBOX_BATCH` | `30m`, `1s`, `50` | Передаются `order-service` |
+| `PARTNER_POS_API_KEY` | `dev-merchant-key-kafe-primer-0001` | Ключ заведения, от имени которого работает касса |
+| `POS_PUBLISH_ON_START`, `POS_STOCK_SYNC_INTERVAL`, `POS_ORDER_POLL_INTERVAL`, `POS_KITCHEN_STEP` | `true`, `1m`, `5s`, `20s` | `PUBLISH_ON_START`, `STOCK_SYNC_INTERVAL`, `ORDER_POLL_INTERVAL` и `KITCHEN_STEP` кассы |
+| `DEV_MERCHANT_KEY_*` | | Справочно: демонстрационные ключи из `migrations/merchant/0002_seed.sql`; стенд их не читает |
+
+### Переменные сервисов
+
+Сервис читает конфигурацию из окружения при старте
+(`internal/<сервис>/config/config.go`) и при недопустимом значении не
+запускается, перечислив все ошибки сразу. Длительности записываются в формате Go:
+`300ms`, `5s`, `1m`, `2h`.
+
+Общие для `merchant-service`, `inventory-service`, `catalog-service` и
+`order-service`:
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `DATABASE_URL` | обязательна | Строка подключения к своей базе |
+| `SERVICE_NAME` | имя сервиса | Поле `service` в логах |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` или `error`; другое значение — `info` |
+| `HTTP_ADDR` | `:8080` | Публичный HTTP API |
+| `GRPC_ADDR` | `:9090` | Внутренний gRPC; у `order-service` его нет |
+| `OPS_ADDR` | `:9091` | `/healthz` и `/readyz` |
+| `DB_MAX_CONNS`, `DB_MIN_CONNS` | `10`, `2` | Размер пула соединений; `DB_MAX_CONNS > 0`, `DB_MIN_CONNS ≤ DB_MAX_CONNS` |
+| `DB_CONNECT_TIMEOUT` | `5s` | Установка соединения |
+| `DB_STATEMENT_TIMEOUT` | `3s` у merchant и inventory, `5s` у catalog и order | `statement_timeout` соединений пула |
+| `DB_MAX_CONN_LIFETIME`, `DB_MAX_CONN_IDLE_TIME` | `30m`, `5m` | Ротация соединений пула |
+| `HTTP_READ_HEADER_TIMEOUT`, `HTTP_READ_TIMEOUT`, `HTTP_WRITE_TIMEOUT`, `HTTP_IDLE_TIMEOUT` | `5s`, `15s`, `20s`, `60s` | Таймауты HTTP-сервера |
+| `HTTP_HANDLER_TIMEOUT` | `10s` | Предел обработки одного запроса |
+| `HTTP_MAX_BODY_BYTES` | `65536`, у catalog `1048576` | Предел тела запроса; больше — 413 `PAYLOAD_TOO_LARGE` |
+| `GRPC_HANDLER_TIMEOUT`, `GRPC_MAX_CONNECTION_AGE` | `5s`, `30m` | gRPC-сервер merchant, inventory и catalog |
+| `GRPC_KEEPALIVE_TIME`, `GRPC_KEEPALIVE_TIMEOUT`, `GRPC_MAX_RECV_MSG_BYTES` | `30s`, `10s`, `4194304` | Keepalive и предел сообщения gRPC; у `order-service` — для его клиентов |
+| `SHUTDOWN_TIMEOUT` | `25s` | Время на завершение запросов после SIGTERM |
+| `READINESS_TIMEOUT` | `2s` | Проверка базы в `/readyz` |
+| `RUN_MIGRATIONS` | `false` | Применять миграции при старте сервиса, а не отдельным job |
+
+Свои у каждого сервиса:
+
+| Сервис | Переменная | По умолчанию | Назначение |
+|---|---|---|---|
+| merchant | `MAX_MERCHANT_BATCH` | `100` | Наибольшее число идентификаторов в одном `GetMerchants` |
+| inventory, catalog | `MERCHANT_GRPC_TARGET` | `dns:///merchant-service:9090` | Адрес merchant-service для проверки ключей заведений |
+| inventory, catalog | `MERCHANT_CALL_TIMEOUT` | `300ms` | Дедлайн `AuthenticateApiKey` |
+| inventory, catalog | `MERCHANT_KEEPALIVE_TIME` | `30s` | Keepalive соединения с merchant-service |
+| inventory | `RESERVATION_DEFAULT_TTL` | `30m` | Срок удержания, если `Reserve` пришёл без TTL |
+| inventory | `RESERVATION_MAX_TTL` | `2h` | Больший запрошенный срок урезается до него; не меньше `RESERVATION_DEFAULT_TTL` |
+| inventory | `MAX_AVAILABILITY_BATCH` | `100` | Наибольшее число позиций в одном запросе доступности |
+| inventory | `SWEEPER_INTERVAL`, `SWEEPER_BATCH`, `SWEEPER_TIMEOUT` | `1m`, `100`, `30s` | Период, размер пачки и предел одного прохода sweeper просроченных удержаний |
+| catalog | `MAX_QUOTE_BATCH` | `100` | Наибольшее число позиций в одном `QuoteItems` |
+| order | `MERCHANT_GRPC_TARGET`, `CATALOG_GRPC_TARGET`, `INVENTORY_GRPC_TARGET` | `dns:///merchant-service:9090`, `dns:///catalog-service:9090`, `dns:///inventory-service:9090` | Адреса трёх сервисов-владельцев |
+| order | `MERCHANT_CALL_TIMEOUT`, `MERCHANT_PROFILE_TIMEOUT` | `300ms`, `500ms` | Дедлайны `AuthenticateApiKey` и `GetMerchant` |
+| order | `CATALOG_QUOTE_TIMEOUT` | `500ms` | Дедлайн `QuoteItems` |
+| order | `INVENTORY_READ_TIMEOUT`, `INVENTORY_RESERVE_TIMEOUT`, `INVENTORY_DECISION_TIMEOUT` | `500ms`, `800ms`, `3s` | Дедлайны `GetAvailability`, `Reserve` и `CommitReservation` / `ReleaseReservation` |
+| order | `RESERVATION_TTL` | `30m` | Срок удержания, который сервис запрашивает при оформлении. Должен быть больше окна повторов outbox (около 23,5 минуты при 12 попытках), иначе сервис не запустится |
+| order | `OUTBOX_MAX_ATTEMPTS` | `12` | Число попыток, после которого сообщение переводится в `FAILED` |
+| order | `OUTBOX_INTERVAL`, `OUTBOX_BATCH` | `1s`, `50` | Период и размер пачки диспетчера outbox |
+| order | `OUTBOX_LEASE` | `1m` | На сколько захваченное сообщение скрыто от других диспетчеров; не меньше `INVENTORY_DECISION_TIMEOUT` |
+| order | `OUTBOX_TIMEOUT` | `30s` | Предел одного прохода диспетчера |
+
+`partner-pos` (базы нет):
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `PARTNER_POS_API_KEY` | обязательна | Ключ заведения, от имени которого касса вызывает платформу |
+| `CATALOG_BASE_URL`, `INVENTORY_BASE_URL`, `ORDER_BASE_URL` | `http://catalog-service:8080`, `http://inventory-service:8080`, `http://order-service:8080` | Публичные API платформы |
+| `PLATFORM_TIMEOUT` | `5s` | Предел одного HTTP-вызова платформы |
+| `PUBLISH_ON_START` | `true` | Публиковать меню при старте и повторять до успеха; при `false` касса ждёт `POST /pos/publish` |
+| `STOCK_SYNC_INTERVAL` | `1m` | Период выталкивания изменённых кассой остатков и стоп-листа |
+| `ORDER_POLL_INTERVAL` | `5s` | Период опроса очереди заказов |
+| `KITCHEN_STEP` | `20s` | Длительность одного шага имитации кухни |
+| `ORDER_PAGE_LIMIT` | `50` | Заказов за один опрос |
+| `SERVICE_NAME`, `LOG_LEVEL`, `HTTP_ADDR`, `OPS_ADDR` | `partner-pos`, `info`, `:8080`, `:9091` | Как у сервисов платформы |
+| `HTTP_READ_HEADER_TIMEOUT`, `HTTP_READ_TIMEOUT`, `HTTP_WRITE_TIMEOUT`, `HTTP_IDLE_TIMEOUT`, `HTTP_MAX_BODY_BYTES` | `5s`, `15s`, `20s`, `60s`, `65536` | Как у сервисов платформы |
+| `HTTP_HANDLER_TIMEOUT` | `30s` | Предел обработки запроса; больше `PLATFORM_TIMEOUT`, потому что `POST /pos/publish` вызывает платформу несколько раз |
+| `SHUTDOWN_TIMEOUT` | `15s` | Время на завершение запросов после SIGTERM |
+
+Job миграций (`cmd/migrate`):
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `MIGRATE_SERVICE` | `merchant` | `merchant`, `inventory`, `catalog` или `orders` |
+| `DATABASE_URL` | обязательна | Строка подключения ролью `*_migrator` |
+| `MIGRATE_TIMEOUT` | `2m` | Предел всего прогона |
+| `LOG_LEVEL` | `info` | Уровень логов |
+
+Тесты:
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `TEST_DATABASE_URL` | в `Makefile`: `postgres://postgres:postgres@127.0.0.1:5499/postgres?sslmode=disable` | Подключение суперпользователя PostgreSQL для интеграционных тестов; каждый тест создаёт и удаляет свою базу. Без переменной `go test` пропускает эти тесты |
+| `E2E_MERCHANT_URL`, `E2E_CATALOG_URL`, `E2E_INVENTORY_URL`, `E2E_ORDER_URL` | в `Makefile`: `http://localhost:8081` … `:8084` | Адреса стенда для сквозных тестов; без любой из них тесты пропускаются |
+| `E2E_POS_URL` | в `Makefile`: `http://localhost:8085` | Касса для сквозных тестов; без неё пропускается сценарий кассы, а её режим тесты не трогают |
 
 ## Разработка без Docker
 
@@ -220,25 +431,34 @@ make build            # go build ./...
 make test             # unit-тесты, БД не требуется
 make test-integration # + тесты против настоящего PostgreSQL
 make test-race        # полный набор под детектором гонок
-make check            # то же, что делает CI
+make lint             # golangci-lint v2; если он не установлен — go vet
+make check            # fmt-check, vet, lint, verify и test-race
 make generate         # регенерация gRPC-кода из api/proto
 ```
 
 Интеграционные тесты берут строку подключения из `TEST_DATABASE_URL` и создают
 отдельную базу на каждый тест. Если переменная не задана, эти тесты
 пропускаются — `go test ./...` остаётся работоспособным без базы.
+`make test-integration`, `make test-race` и `make check` по умолчанию
+подставляют PostgreSQL стенда, поэтому он должен быть запущен — весь стенд
+(`make up`) или только база:
 
-`````markdown
-export TEST_DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5499/postgres?sslmode=disable'
+```bash
+docker compose up -d --wait postgres
 make test-race
-````
+```
+
+Для `go test` без `make` строка подключения задаётся явно:
+
+```bash
+export TEST_DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5499/postgres?sslmode=disable'
+go test -race -count=1 ./...
+```
 
 Порт 5499 — это порт, на котором стенд публикует PostgreSQL наружу
 (`POSTGRES_PORT` в `.env`). Внутри сети Compose сервисы обращаются к
 `postgres:5432`; порт хоста отличается, чтобы не конфликтовать с локально
 установленным PostgreSQL.
-````
-
 
 Применение миграций вручную:
 
@@ -361,7 +581,7 @@ SHA-256.
 | `stock_movements` | Append-only журнал изменений количеств | `kind IN ('SET','ADJUST','RESERVE','RELEASE','COMMIT','EXPIRE')`; запись в той же транзакции, что и изменение |
 | `stock_operations` | Дедупликация относительных изменений | PK (`stock_item_id`, `operation_key`) |
 
-Конкурентность решается одним условным `UPDATE` на строку:
+Конкурентность удержаний решается одним условным `UPDATE` на строку:
 `SET reserved_qty = reserved_qty + $qty WHERE ... AND sales_state = 'ENABLED'
 AND on_hand_qty - reserved_qty >= $qty`. PostgreSQL сам блокирует строку и
 перепроверяет условие, поэтому перепродажа невозможна без явных блокировок и
@@ -370,6 +590,12 @@ AND on_hand_qty - reserved_qty >= $qty`. PostgreSQL сам блокирует с
 блокировки. Терминальный переход удержания выполняется условием
 `WHERE id = $1 AND state = 'HELD'` и потому происходит ровно один раз, даже
 когда подтверждение, освобождение и sweeper соревнуются между собой.
+
+Операции заведения (`PUT`, `POST …/adjust` и `PATCH` карточки) вычисляют новое
+значение из прочитанной карточки, поэтому сначала блокируют её
+`SELECT … FOR UPDATE`. Без блокировки параллельные корректировки теряли бы
+друг друга, а корректировка во время списания подтверждённого заказа
+возвращала бы списанные штуки.
 
 ## Внешний API catalog-service
 
@@ -601,6 +827,11 @@ curl -s -X POST localhost:8085/pos/publish
 curl -s -X PUT -H 'Content-Type: application/json' \
      -d '{"mode":"AUTO_REJECT","eta_minutes":20,"reject_reason":"закончились продукты","kitchen":false}' \
      localhost:8085/pos/behavior
+
+# вернуть ручной режим по умолчанию
+curl -s -X PUT -H 'Content-Type: application/json' \
+     -d '{"mode":"MANUAL","eta_minutes":25,"reject_reason":"закончились продукты","kitchen":true}' \
+     localhost:8085/pos/behavior
 ```
 
 Решение о статусе выводится из того, что сообщает платформа: из статуса заказа
@@ -668,8 +899,13 @@ test/e2e/           сквозные сценарии против запуще�
 
 ## Требования окружения
 
-Docker c плагином Compose — для запуска. Go 1.24+ и PostgreSQL 16+ — для
-разработки и интеграционных тестов. Доступ к прокси Go-модулей — для первой
-сборки (`make deps`); зависимости в поставку не включены. `protoc` с плагинами `protoc-gen-go` и
-`protoc-gen-go-grpc` — только для `make generate`; сгенерированный код
-закоммичен, поэтому для сборки они не нужны.
+| Что | Для чего |
+|---|---|
+| Docker с плагином Compose v2 (`docker compose`) | Стенд: `make up`, `make stack-check` |
+| `make`, `bash`, `curl` | Цели `Makefile`, `make wait`, smoke-скрипты |
+| `python3` | Разбор JSON в smoke-скриптах и примерах README |
+| Go 1.24+ | Сборка без Docker, все тесты, `make e2e` |
+| PostgreSQL 16+ | Интеграционные тесты; подходит PostgreSQL 18 стенда на порту 5499 |
+| Доступ к Docker Hub и прокси Go-модулей | Первая сборка: базовые образы `golang:1.24-alpine`, `alpine:3.21`, `postgres:18.6-alpine` и зависимости из `go.mod` (`make deps`); в поставку они не включены |
+| golangci-lint v2 (необязательно) | `make lint`; без него `make lint` выполняет `go vet`. CI использует v2.14.0 |
+| `protoc` с плагинами `protoc-gen-go` и `protoc-gen-go-grpc` | Только `make generate`: сгенерированный код закоммичен, для сборки они не нужны |

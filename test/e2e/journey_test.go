@@ -3,17 +3,30 @@
 // These tests use no in-process fakes: every call goes to a real service over
 // the network, and the assertions are about the state the whole system ends up
 // in. They are skipped unless the four base URLs are provided, so `go test
-// ./...` stays runnable without a stack:
+// ./...` stays runnable without a stack. `make e2e` provides them with the
+// ports Docker Compose publishes:
 //
 //	docker compose up --build -d
+//	make wait e2e
+//
+// which is the same as
+//
 //	E2E_MERCHANT_URL=http://localhost:8081 \
 //	E2E_CATALOG_URL=http://localhost:8082 \
 //	E2E_INVENTORY_URL=http://localhost:8083 \
 //	E2E_ORDER_URL=http://localhost:8084 \
+//	E2E_POS_URL=http://localhost:8085 \
 //	go test ./test/e2e/... -count=1 -v
+//
+// E2E_POS_URL is optional: without it the scenario of the demonstration till
+// is skipped. Every test establishes the state it relies on itself - the
+// profile of the outlet, its stock, the MANUAL mode of the till and a queue
+// without orders waiting for a decision - so the suite can be repeated against
+// the same stack, after the smoke scripts and after manual experiments.
 package e2e_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,11 +48,19 @@ const (
 	apiKey           = "dev-merchant-key-kafe-primer-0001"
 )
 
+// settleLimit bounds every wait for a decision delivered through the outbox.
+const settleLimit = 30 * time.Second
+
+// tillManual is the default behaviour of the demonstration till: it leaves the
+// orders alone, so the scenarios decide them themselves.
+const tillManual = `{"mode":"MANUAL","eta_minutes":25,"reject_reason":"закончились продукты","kitchen":true}`
+
 type stack struct {
 	merchant  string
 	catalog   string
 	inventory string
 	order     string
+	pos       string
 	client    *http.Client
 }
 
@@ -50,11 +71,12 @@ func requireStack(t *testing.T) stack {
 		catalog:   os.Getenv("E2E_CATALOG_URL"),
 		inventory: os.Getenv("E2E_INVENTORY_URL"),
 		order:     os.Getenv("E2E_ORDER_URL"),
+		pos:       os.Getenv("E2E_POS_URL"),
 		client:    &http.Client{Timeout: 10 * time.Second},
 	}
 	if s.merchant == "" || s.catalog == "" || s.inventory == "" || s.order == "" {
 		t.Skip("end-to-end tests need E2E_MERCHANT_URL, E2E_CATALOG_URL, " +
-			"E2E_INVENTORY_URL and E2E_ORDER_URL pointing at a running stack")
+			"E2E_INVENTORY_URL and E2E_ORDER_URL pointing at a running stack (make e2e)")
 	}
 	return s
 }
@@ -72,13 +94,15 @@ func (r response) decode(t *testing.T, dst any) {
 	}
 }
 
+// call performs one request. It uses its own context rather than the one of
+// the test, because it also runs from cleanups, after that context is done.
 func (s stack) call(t *testing.T, method, url, body string, headers map[string]string) response {
 	t.Helper()
 	var reader io.Reader
 	if body != "" {
 		reader = strings.NewReader(body)
 	}
-	req, err := http.NewRequest(method, url, reader)
+	req, err := http.NewRequestWithContext(context.Background(), method, url, reader)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
@@ -152,6 +176,97 @@ func (s stack) setOnHand(t *testing.T, menuItemID string, qty int) {
 		body, merchantHeaders())
 }
 
+// setSalesState puts a card on the stop list or takes it off.
+func (s stack) setSalesState(t *testing.T, menuItemID, state string) {
+	t.Helper()
+	s.expect(t, http.StatusOK, http.MethodPatch,
+		fmt.Sprintf("%s/api/v1/merchant/stock/%s", s.inventory, menuItemID),
+		fmt.Sprintf(`{"sales_state":%q}`, state), merchantHeaders())
+}
+
+// prepareStock gives a card a known state: no units held, qty on hand and the
+// given stop-list switch. Holds of orders decided by an earlier run come back
+// asynchronously through the outbox, so it first waits for them to settle;
+// counting from a card that still carries them would make every expectation
+// of the test wrong.
+func (s stack) prepareStock(t *testing.T, menuItemID string, qty int, state string) {
+	t.Helper()
+	s.waitForStock(t, menuItemID, -1, 0, settleLimit)
+	s.setOnHand(t, menuItemID, qty)
+	s.setSalesState(t, menuItemID, state)
+}
+
+// acceptOrders opens the demonstration outlet for orders with the minimum of
+// the seed. A profile left closed or with a higher minimum by a manual
+// experiment would otherwise refuse the baskets of the scenarios.
+func (s stack) acceptOrders(t *testing.T) {
+	t.Helper()
+	s.expect(t, http.StatusOK, http.MethodPatch, s.merchant+"/api/v1/merchant/profile",
+		`{"is_accepting_orders":true,"min_order_minor":50000}`, merchantHeaders())
+}
+
+// manualTill returns the demonstration till to its default MANUAL mode. Left
+// in an automatic mode by a manual experiment or an interrupted run, it would
+// answer the orders of the scenarios before they do. Without E2E_POS_URL the
+// till is out of reach and is left as it is.
+func (s stack) manualTill(t *testing.T) {
+	t.Helper()
+	if s.pos == "" {
+		return
+	}
+	s.expect(t, http.StatusOK, http.MethodPut, s.pos+"/pos/behavior", tillManual, nil)
+}
+
+// rejectLeftovers refuses the orders that still wait for a decision of the
+// outlet: those of a manual experiment or of a run that stopped half-way. Each
+// of them holds its units until the reservation expires (30 minutes by
+// default), and a card that carries such a hold never comes to the state the
+// scenarios count from. An order decided in the meantime answers 409 and is
+// left as it is.
+func (s stack) rejectLeftovers(t *testing.T) {
+	t.Helper()
+	for range 20 {
+		var queue struct {
+			Items []struct {
+				OrderID string `json:"order_id"`
+			} `json:"items"`
+		}
+		s.expect(t, http.StatusOK, http.MethodGet,
+			s.order+"/api/v1/merchant/orders?status=CREATED&limit=50", "",
+			merchantHeaders()).decode(t, &queue)
+		if len(queue.Items) == 0 {
+			return
+		}
+		for _, item := range queue.Items {
+			resp := s.call(t, http.MethodPost,
+				fmt.Sprintf("%s/api/v1/merchant/orders/%s/reject", s.order, item.OrderID),
+				`{"reason":"e2e: заказ остался от прошлого прогона"}`, merchantHeaders())
+			if resp.status != http.StatusOK && resp.status != http.StatusConflict {
+				t.Fatalf("reject the leftover order %s = %d: %s", item.OrderID, resp.status, resp.body)
+			}
+		}
+	}
+	t.Fatal("the queue of the demonstration outlet keeps orders waiting for a decision")
+}
+
+// prepareOutlet gives the demonstration outlet the state every scenario counts
+// from: open for orders with the minimum of the seed, the till in MANUAL mode
+// and no order waiting for a decision.
+func (s stack) prepareOutlet(t *testing.T) {
+	t.Helper()
+	s.acceptOrders(t)
+	s.manualTill(t)
+	s.rejectLeftovers(t)
+}
+
+// prepareSellable is the starting point of every scenario that places an
+// order: a prepared outlet and ten sellable units with nothing held.
+func (s stack) prepareSellable(t *testing.T) {
+	t.Helper()
+	s.prepareOutlet(t)
+	s.prepareStock(t, itemSellable, 10, "ENABLED")
+}
+
 // waitForAvailability polls until the units reach want or the deadline passes.
 // The delivery of a terminal decision is asynchronous, so the check has an
 // explicit condition and a bound rather than a fixed sleep.
@@ -183,6 +298,7 @@ func (s stack) stockCard(t *testing.T, menuItemID string) (onHand, reserved int3
 }
 
 // waitForStock ждёт, пока карточка остатка придёт в конечное состояние.
+// Отрицательный wantOnHand означает «количество не важно».
 //
 // Для подтверждения заказа ждать по available_qty нельзя: он равен
 // on_hand - reserved и одинаков до фиксации и после неё, потому что удержание
@@ -196,7 +312,7 @@ func (s stack) waitForStock(t *testing.T, menuItemID string, wantOnHand, wantRes
 	var onHand, reserved int32
 	for time.Now().Before(deadline) {
 		onHand, reserved = s.stockCard(t, menuItemID)
-		if onHand == wantOnHand && reserved == wantReserved {
+		if (wantOnHand < 0 || onHand == wantOnHand) && reserved == wantReserved {
 			return
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -217,6 +333,25 @@ type orderPayload struct {
 		UnitPriceMinor int64  `json:"unit_price_minor"`
 		Qty            int32  `json:"qty"`
 	} `json:"items"`
+}
+
+// waitForStatus polls the order as its customer sees it until it reaches want.
+func (s stack) waitForStatus(t *testing.T, customerID, orderID, want string, limit time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(limit)
+	var last string
+	for time.Now().Before(deadline) {
+		var order orderPayload
+		s.expect(t, http.StatusOK, http.MethodGet,
+			fmt.Sprintf("%s/api/v1/orders/%s", s.order, orderID), "",
+			customerHeaders(customerID, "")).decode(t, &order)
+		last = order.Status
+		if last == want {
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("order %s stayed %s, want %s within %s", orderID, last, want, limit)
 }
 
 func basket(menuItemID string, qty int) string {
@@ -241,7 +376,7 @@ const minOrderQty = 2
 // checks the state each of them ends up in.
 func TestHappyPath(t *testing.T) {
 	s := requireStack(t)
-	s.setOnHand(t, itemSellable, 10)
+	s.prepareSellable(t)
 	customerID := uuid.NewString()
 
 	// The menu comes from catalog-service and the units from
@@ -265,6 +400,7 @@ func TestHappyPath(t *testing.T) {
 	if before < 3 {
 		t.Fatalf("the test needs at least 3 units, got %d", before)
 	}
+	onHandBefore, _ := s.stockCard(t, itemSellable)
 
 	// Preview recalculates the basket against all three owners.
 	preview := s.expect(t, http.StatusOK, http.MethodPost,
@@ -303,6 +439,9 @@ func TestHappyPath(t *testing.T) {
 	if replayed.OrderID != order.OrderID {
 		t.Fatalf("a repeat created a second order: %s", replay.body)
 	}
+	if replay.header.Get("Idempotent-Replay") != "true" {
+		t.Fatalf("a repeat must be marked with Idempotent-Replay: %v", replay.header)
+	}
 	if got := s.availableQty(t, itemSellable); got != before-3 {
 		t.Fatalf("availability = %d after the repeat, want %d", got, before-3)
 	}
@@ -319,13 +458,7 @@ func TestHappyPath(t *testing.T) {
 	s.expect(t, http.StatusOK, http.MethodPost,
 		fmt.Sprintf("%s/api/v1/merchant/orders/%s/accept", s.order, order.OrderID),
 		`{"eta_minutes":25}`, merchantHeaders())
-	s.waitForStock(t, itemSellable, before-3, 0, 30*time.Second)
-
-	onHand, reserved := s.stockCard(t, itemSellable)
-	if onHand != before-3 || reserved != 0 {
-		t.Fatalf("on hand = %d, reserved = %d, want the units consumed, not held",
-			onHand, reserved)
-	}
+	s.waitForStock(t, itemSellable, onHandBefore-3, 0, settleLimit)
 
 	// The merchant walks the order to the customer.
 	for _, status := range []string{"COOKING", "DELIVERING", "DELIVERED"} {
@@ -347,7 +480,7 @@ func TestHappyPath(t *testing.T) {
 // withdraws the order and the held units come back.
 func TestCancellationReturnsUnits(t *testing.T) {
 	s := requireStack(t)
-	s.setOnHand(t, itemSellable, 10)
+	s.prepareSellable(t)
 	customerID := uuid.NewString()
 	before := s.availableQty(t, itemSellable)
 
@@ -363,7 +496,15 @@ func TestCancellationReturnsUnits(t *testing.T) {
 	s.expect(t, http.StatusOK, http.MethodPost,
 		fmt.Sprintf("%s/api/v1/orders/%s/cancel", s.order, order.OrderID), "",
 		customerHeaders(customerID, ""))
-	s.waitForAvailability(t, itemSellable, before, 30*time.Second)
+	s.waitForAvailability(t, itemSellable, before, settleLimit)
+
+	// Cancelling again changes nothing and says so.
+	again := s.expect(t, http.StatusOK, http.MethodPost,
+		fmt.Sprintf("%s/api/v1/orders/%s/cancel", s.order, order.OrderID), "",
+		customerHeaders(customerID, ""))
+	if again.header.Get("Idempotent-Replay") != "true" {
+		t.Fatalf("a repeated cancellation must be marked with Idempotent-Replay: %v", again.header)
+	}
 
 	// A cancelled order is terminal for the merchant too.
 	conflict := s.call(t, http.MethodPost,
@@ -377,7 +518,7 @@ func TestCancellationReturnsUnits(t *testing.T) {
 // TestRejectionReturnsUnits proves the same path driven by the merchant.
 func TestRejectionReturnsUnits(t *testing.T) {
 	s := requireStack(t)
-	s.setOnHand(t, itemSellable, 10)
+	s.prepareSellable(t)
 	customerID := uuid.NewString()
 	before := s.availableQty(t, itemSellable)
 
@@ -390,13 +531,18 @@ func TestRejectionReturnsUnits(t *testing.T) {
 	s.expect(t, http.StatusOK, http.MethodPost,
 		fmt.Sprintf("%s/api/v1/merchant/orders/%s/reject", s.order, order.OrderID),
 		`{"reason":"закончились продукты"}`, merchantHeaders())
-	s.waitForAvailability(t, itemSellable, before, 30*time.Second)
+	s.waitForAvailability(t, itemSellable, before, settleLimit)
 }
 
 // TestRefusedBaskets checks that the reasons a customer can hit are reported
 // as conflicts and change nothing.
 func TestRefusedBaskets(t *testing.T) {
 	s := requireStack(t)
+	s.prepareOutlet(t)
+	// The two demonstration states: allowed but without a single unit, and
+	// units on hand while the position is on the stop list.
+	s.prepareStock(t, itemEnabledEmpty, 0, "ENABLED")
+	s.prepareStock(t, itemStopped, 5, "STOPPED")
 	customerID := uuid.NewString()
 
 	cases := []struct {
@@ -425,13 +571,17 @@ func TestRefusedBaskets(t *testing.T) {
 			}
 		})
 	}
+	// A refused basket holds nothing.
+	if _, reserved := s.stockCard(t, itemStopped); reserved != 0 {
+		t.Fatalf("a refused basket held %d units", reserved)
+	}
 }
 
 // TestOrderIsScopedToItsCustomer checks that an order is not readable by
 // anyone who guesses its identifier.
 func TestOrderIsScopedToItsCustomer(t *testing.T) {
 	s := requireStack(t)
-	s.setOnHand(t, itemSellable, 10)
+	s.prepareSellable(t)
 	customerID := uuid.NewString()
 
 	created := s.expect(t, http.StatusCreated, http.MethodPost,
@@ -440,9 +590,12 @@ func TestOrderIsScopedToItsCustomer(t *testing.T) {
 	var order orderPayload
 	created.decode(t, &order)
 	t.Cleanup(func() {
+		// The order must not keep its units after the test: the next run, or
+		// the next suite, counts from a card without holds.
 		s.call(t, http.MethodPost,
 			fmt.Sprintf("%s/api/v1/orders/%s/cancel", s.order, order.OrderID), "",
 			customerHeaders(customerID, ""))
+		s.waitForStock(t, itemSellable, -1, 0, settleLimit)
 	})
 
 	resp := s.call(t, http.MethodGet,
@@ -453,7 +606,7 @@ func TestOrderIsScopedToItsCustomer(t *testing.T) {
 	}
 }
 
-// TestBodyIsRejectedWithoutHeaders checks the two headers the placement needs.
+// TestPlacementRequiresItsHeaders checks the two headers the placement needs.
 func TestPlacementRequiresItsHeaders(t *testing.T) {
 	s := requireStack(t)
 	resp := s.call(t, http.MethodPost, s.order+"/api/v1/orders",
@@ -463,8 +616,9 @@ func TestPlacementRequiresItsHeaders(t *testing.T) {
 	}
 }
 
-// TestOpsEndpoints checks that every service reports itself ready.
-func TestOpsEndpoints(t *testing.T) {
+// TestUnknownEndpointsAre404 checks that every service answers a path outside
+// its contract with 404 in the shared error envelope.
+func TestUnknownEndpointsAre404(t *testing.T) {
 	s := requireStack(t)
 	for name, base := range map[string]string{
 		"merchant": s.merchant, "catalog": s.catalog,
@@ -474,5 +628,68 @@ func TestOpsEndpoints(t *testing.T) {
 		if resp.status != http.StatusNotFound {
 			t.Fatalf("%s: unknown endpoint = %d, want 404", name, resp.status)
 		}
+		var payload struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		resp.decode(t, &payload)
+		if payload.Error.Code == "" {
+			t.Fatalf("%s: a 404 must carry the error envelope: %s", name, resp.body)
+		}
+	}
+}
+
+// TestPartnerPosAnswersTheQueue drives the demonstration till (requirement
+// A-06) from the outside: it is switched to automatic answers, and the orders
+// it confirms or refuses reach the platform like those of any outlet. The till
+// is put back into MANUAL mode whatever happens, because in an automatic mode
+// it would answer the orders of every other scenario.
+func TestPartnerPosAnswersTheQueue(t *testing.T) {
+	s := requireStack(t)
+	if s.pos == "" {
+		t.Skip("E2E_POS_URL is not set; skipping the scenario of the demonstration till")
+	}
+	s.prepareSellable(t)
+	setBehavior := func(t *testing.T, body string) {
+		t.Helper()
+		s.expect(t, http.StatusOK, http.MethodPut, s.pos+"/pos/behavior", body, nil)
+	}
+	t.Cleanup(func() {
+		resp := s.call(t, http.MethodPut, s.pos+"/pos/behavior", tillManual, nil)
+		if resp.status != http.StatusOK {
+			t.Errorf("restore MANUAL mode = %d: %s", resp.status, resp.body)
+		}
+	})
+	customerID := uuid.NewString()
+	place := func(t *testing.T, key string) string {
+		t.Helper()
+		var order orderPayload
+		s.expect(t, http.StatusCreated, http.MethodPost, s.order+"/api/v1/orders",
+			basket(itemSellable, minOrderQty), customerHeaders(customerID, key)).decode(t, &order)
+		return order.OrderID
+	}
+
+	// Refusal: the till answers on its own, and the units come back.
+	before := s.availableQty(t, itemSellable)
+	setBehavior(t, `{"mode":"AUTO_REJECT","eta_minutes":20,"reject_reason":"закончились продукты","kitchen":false}`)
+	rejected := place(t, "e2e-pos-reject-"+customerID)
+	s.waitForStatus(t, customerID, rejected, "REJECTED", settleLimit)
+	s.waitForAvailability(t, itemSellable, before, settleLimit)
+
+	// Confirmation: the till accepts with its own estimate and the units are
+	// consumed. The kitchen is off, so the order stays CONFIRMED.
+	onHandBefore, _ := s.stockCard(t, itemSellable)
+	setBehavior(t, `{"mode":"AUTO_ACCEPT","eta_minutes":30,"reject_reason":"нет","kitchen":false}`)
+	accepted := place(t, "e2e-pos-accept-"+customerID)
+	s.waitForStatus(t, customerID, accepted, "CONFIRMED", settleLimit)
+	s.waitForStock(t, itemSellable, onHandBefore-minOrderQty, 0, settleLimit)
+
+	var order orderPayload
+	s.expect(t, http.StatusOK, http.MethodGet,
+		fmt.Sprintf("%s/api/v1/orders/%s", s.order, accepted), "",
+		customerHeaders(customerID, "")).decode(t, &order)
+	if order.ETAMinutes != 30 {
+		t.Fatalf("eta = %d, want the estimate of the till (30)", order.ETAMinutes)
 	}
 }

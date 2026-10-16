@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -109,6 +110,16 @@ type ItemPatch struct {
 
 // IsEmpty reports whether the patch would change nothing.
 func (p ItemPatch) IsEmpty() bool { return p.Name == nil && p.PriceMinor == nil }
+
+// Normalize trims the name the way publication trims it, so a patch can store
+// neither surrounding spaces nor a name made of spaces only.
+func (p ItemPatch) Normalize() ItemPatch {
+	if p.Name != nil {
+		name := strings.TrimSpace(*p.Name)
+		p.Name = &name
+	}
+	return p
+}
 
 // Validate checks the patch against the business bounds.
 func (p ItemPatch) Validate() error {

@@ -87,6 +87,30 @@ func TestItemPatchIsEmpty(t *testing.T) {
 	}
 }
 
+// A patch trims the name the way publication does: surrounding spaces are not
+// stored, and a name of spaces only is no name at all.
+func TestItemPatchNormalizeTrimsTheName(t *testing.T) {
+	t.Parallel()
+	trimmed := domain.ItemPatch{Name: ptr("  Борщ с говядиной \t")}.Normalize()
+	if *trimmed.Name != "Борщ с говядиной" {
+		t.Fatalf("name = %q, want it trimmed", *trimmed.Name)
+	}
+	if err := trimmed.Validate(); err != nil {
+		t.Fatalf("Validate() = %v", err)
+	}
+
+	blank := domain.ItemPatch{Name: ptr("   ")}.Normalize()
+	ve, ok := domain.AsValidationError(blank.Validate())
+	if !ok || !hasField(ve, "name") {
+		t.Fatalf("a name of spaces only = %v, want a violation of name", blank.Validate())
+	}
+
+	price := domain.ItemPatch{PriceMinor: ptr[int64](1000)}.Normalize()
+	if price.Name != nil || *price.PriceMinor != 1000 {
+		t.Fatalf("a patch without a name = %+v, want it unchanged", price)
+	}
+}
+
 func hasField(ve *domain.ValidationError, field string) bool {
 	for _, v := range ve.Violations {
 		if v.Field == field {

@@ -174,11 +174,12 @@ FROM orders WHERE customer_id = $1 AND idempotency_key = $2`
 // ListByCustomer returns one page of the customer's history, newest first.
 func (r *OrderRepository) ListByCustomer(ctx context.Context, customerID uuid.UUID,
 	limit, offset int) (app.OrderPage, error) {
-	const q = `SELECT ` + orderColumns + `, count(*) OVER () AS total_count
-FROM orders WHERE customer_id = $1
+	const where = `
+FROM orders WHERE customer_id = $1`
+	const q = `SELECT ` + orderColumns + `, count(*) OVER () AS total_count` + where + `
 ORDER BY created_at DESC, id
 LIMIT $2 OFFSET $3`
-	return r.page(ctx, q, limit, offset, customerID, limit, offset)
+	return r.page(ctx, q, `SELECT count(*)`+where, limit, offset, customerID)
 }
 
 // ListByMerchant returns one page of the merchant's queue, oldest first, so
@@ -189,19 +190,26 @@ func (r *OrderRepository) ListByMerchant(ctx context.Context, merchantID uuid.UU
 	for _, st := range statuses {
 		filter = append(filter, string(st))
 	}
-	const q = `SELECT ` + orderColumns + `, count(*) OVER () AS total_count
+	const where = `
 FROM orders
 WHERE merchant_id = $1
-  AND (coalesce(array_length($2::text[], 1), 0) = 0 OR status = ANY($2))
+  AND (coalesce(array_length($2::text[], 1), 0) = 0 OR status = ANY($2))`
+	const q = `SELECT ` + orderColumns + `, count(*) OVER () AS total_count` + where + `
 ORDER BY created_at, id
 LIMIT $3 OFFSET $4`
-	return r.page(ctx, q, limit, offset, merchantID, filter, limit, offset)
+	return r.page(ctx, q, `SELECT count(*)`+where, limit, offset, merchantID, filter)
 }
 
 // page runs a paginated query and attaches the positions of the whole page in
 // one additional statement, so the cost does not grow with the page size.
-func (r *OrderRepository) page(ctx context.Context, q string, limit, offset int,
-	args ...any) (app.OrderPage, error) {
+//
+// q takes the filter arguments followed by limit and offset; countQ takes the
+// filter arguments only. The total normally rides on the page as a window
+// count, but a page past the end has no rows to carry it, so countQ answers
+// for that page: the client still needs the total to page back.
+func (r *OrderRepository) page(ctx context.Context, q, countQ string, limit, offset int,
+	filter ...any) (app.OrderPage, error) {
+	args := append(append(make([]any, 0, len(filter)+2), filter...), limit, offset)
 	rows, err := r.tx.Querier(ctx).Query(ctx, q, args...)
 	if err != nil {
 		return app.OrderPage{}, fmt.Errorf("list orders: %w", err)
@@ -227,6 +235,11 @@ func (r *OrderRepository) page(ctx context.Context, q string, limit, offset int,
 	}
 	if err := rows.Err(); err != nil {
 		return app.OrderPage{}, fmt.Errorf("iterate orders: %w", err)
+	}
+	if len(orders) == 0 && offset > 0 {
+		if err := r.tx.Querier(ctx).QueryRow(ctx, countQ, filter...).Scan(&total); err != nil {
+			return app.OrderPage{}, fmt.Errorf("count orders: %w", err)
+		}
 	}
 
 	items, err := r.itemsOf(ctx, ids)

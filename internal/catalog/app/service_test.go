@@ -181,6 +181,28 @@ func TestUpdateMenuItemBumpsTheMenuVersion(t *testing.T) {
 	}
 }
 
+// The name of a patched item is trimmed like a published one, and a name of
+// spaces only is refused instead of being stored.
+func TestUpdateMenuItemTrimsTheName(t *testing.T) {
+	t.Parallel()
+	svc, _, _ := newService(t)
+
+	result, err := svc.UpdateMenuItem(context.Background(), testsupport.MerchantID,
+		testsupport.ItemSellable, domain.ItemPatch{Name: ptr("  Борщ  ")}, nil)
+	if err != nil {
+		t.Fatalf("UpdateMenuItem() = %v", err)
+	}
+	if result.Item.Name != "Борщ" {
+		t.Fatalf("name = %q, want it trimmed", result.Item.Name)
+	}
+
+	_, err = svc.UpdateMenuItem(context.Background(), testsupport.MerchantID,
+		testsupport.ItemSellable, domain.ItemPatch{Name: ptr("   ")}, nil)
+	if _, ok := domain.AsValidationError(err); !ok {
+		t.Fatalf("UpdateMenuItem(blank name) = %v, want a validation error", err)
+	}
+}
+
 func TestUpdateMenuItemRejectsAnEmptyPatch(t *testing.T) {
 	t.Parallel()
 	svc, _, _ := newService(t)

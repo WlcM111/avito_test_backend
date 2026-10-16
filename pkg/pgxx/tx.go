@@ -2,6 +2,7 @@ package pgxx
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -50,8 +51,11 @@ func (m *TxManager) InTx(ctx context.Context, opts pgx.TxOptions, fn func(contex
 
 	if err := fn(txCtx); err != nil {
 		panicked = false
-		if rbErr := tx.Rollback(context.WithoutCancel(ctx)); rbErr != nil && !isTxClosed(rbErr) {
-			return fmt.Errorf("%w (rollback failed: %v)", err, rbErr)
+		if rbErr := tx.Rollback(context.WithoutCancel(ctx)); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
+			// Only the error of fn is wrapped: callers classify it (unique or
+			// check violation, not found), and a failed rollback must not
+			// change that classification. It is reported as text.
+			return fmt.Errorf("%w (rollback failed: %v)", err, rbErr) //nolint:errorlint // see above
 		}
 		return err
 	}
@@ -68,8 +72,4 @@ func (m *TxManager) Querier(ctx context.Context) Querier {
 		return tx
 	}
 	return m.pool
-}
-
-func isTxClosed(err error) bool {
-	return err != nil && err.Error() == pgx.ErrTxClosed.Error()
 }

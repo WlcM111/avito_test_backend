@@ -110,6 +110,11 @@ func Load() (Config, error) {
 	if err := l.Err(); err != nil {
 		return Config{}, err
 	}
+	if cfg.DBMinConns > cfg.DBMaxConns {
+		return Config{}, fmt.Errorf(
+			"invalid configuration: DB_MIN_CONNS (%d) must not exceed DB_MAX_CONNS (%d)",
+			cfg.DBMinConns, cfg.DBMaxConns)
+	}
 	if cfg.MaxReservationTTL < cfg.DefaultReservationTTL {
 		return Config{}, fmt.Errorf(
 			"invalid configuration: RESERVATION_MAX_TTL (%s) must not be shorter than RESERVATION_DEFAULT_TTL (%s)",

@@ -129,6 +129,23 @@ func TestListFiltersAndPagination(t *testing.T) {
 	if page1[0].ID == page2[0].ID {
 		t.Fatal("pages overlap")
 	}
+
+	// A page past the end has no rows, yet the total must still be reported,
+	// with the filters applied.
+	past, totalPast, err := repo.List(ctx, domain.ListFilter{Limit: 2, Offset: 10})
+	if err != nil {
+		t.Fatalf("page past the end: %v", err)
+	}
+	if len(past) != 0 || totalPast != 3 {
+		t.Fatalf("past the end: %d merchants, total %d; want 0 and 3", len(past), totalPast)
+	}
+	_, totalFiltered, err := repo.List(ctx, domain.ListFilter{OnlyAccepting: true, Limit: 2, Offset: 10})
+	if err != nil {
+		t.Fatalf("filtered page past the end: %v", err)
+	}
+	if totalFiltered != 2 {
+		t.Fatalf("filtered total past the end = %d, want 2", totalFiltered)
+	}
 }
 
 func TestGetByIDAndByIDs(t *testing.T) {

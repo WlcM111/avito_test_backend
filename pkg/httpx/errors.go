@@ -71,35 +71,47 @@ func (e *Error) WithCause(err error) *Error {
 
 // Convenience constructors for the most frequent failures.
 
+// BadRequest reports a request that cannot be parsed: 400 VALIDATION_FAILED.
 func BadRequest(message string) *Error {
 	return NewError(http.StatusBadRequest, CodeValidationFailed, message)
 }
 
+// Unprocessable reports a well-formed request that fails validation:
+// 422 VALIDATION_FAILED.
 func Unprocessable(message string) *Error {
 	return NewError(http.StatusUnprocessableEntity, CodeValidationFailed, message)
 }
 
+// Unauthorized reports a missing, unknown or revoked access key:
+// 401 UNAUTHORIZED. The message never says which of the three it was.
 func Unauthorized(message string) *Error {
 	return NewError(http.StatusUnauthorized, CodeUnauthorized, message)
 }
 
+// NotFound reports an absent resource or route: 404 NOT_FOUND.
 func NotFound(message string) *Error {
 	return NewError(http.StatusNotFound, CodeNotFound, message)
 }
 
+// Conflict reports a business conflict: 409 with a domain-specific code.
 func Conflict(code, message string) *Error {
 	return NewError(http.StatusConflict, code, message)
 }
 
+// PreconditionFailed reports a stale If-Match: 412 VERSION_CONFLICT.
 func PreconditionFailed(message string) *Error {
 	return NewError(http.StatusPreconditionFailed, CodeVersionConflict, message)
 }
 
+// Internal reports an unexpected failure: 500 INTERNAL_ERROR. The cause is
+// logged but never sent to the client.
 func Internal(cause error) *Error {
 	return NewError(http.StatusInternalServerError, CodeInternal,
 		"internal error").WithCause(cause)
 }
 
+// Unavailable reports that a dependency could not be reached:
+// 503 DEPENDENCY_UNAVAILABLE. The cause is logged but never sent.
 func Unavailable(message string, cause error) *Error {
 	return NewError(http.StatusServiceUnavailable, CodeDependencyDown, message).WithCause(cause)
 }

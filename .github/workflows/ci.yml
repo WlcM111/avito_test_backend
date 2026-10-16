@@ -16,8 +16,10 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
         ports: ["5432:5432"]
+        # TCP, not the unix socket: during the first initialisation the image
+        # runs a temporary server that listens on the socket only.
         options: >-
-          --health-cmd "pg_isready -U postgres"
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
           --health-interval 5s --health-timeout 5s --health-retries 20
     env:
       TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
@@ -38,3 +40,39 @@ jobs:
         run: make vet
       - name: Tests with the race detector and a real PostgreSQL
         run: make test-race
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      # The action also verifies .golangci.yml against the schema of the
+      # pinned version before running the linters.
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Start the whole stack with Docker Compose
+        run: make up
+      - name: Wait until every service reports ready
+        run: make wait
+      - name: Smoke scenarios of every service
+        run: make smoke
+      - name: End-to-end tests against the running stack
+        run: make e2e
+      - name: Logs of the stack
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v

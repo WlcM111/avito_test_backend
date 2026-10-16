@@ -13,7 +13,9 @@ COPY cmd ./cmd
 RUN CGO_ENABLED=0 go build -trimpath \
         -ldflags="-s -w" -o /out/merchant-service ./cmd/merchant-service
 
-# Runtime stage: a distroless-style scratch image with only the static binary.
+# Runtime stage: a minimal Alpine image with the static binary, CA certificates,
+# time zones and curl for the Compose health check; it runs as an unprivileged
+# user.
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata curl && \
     adduser -D -u 10001 app

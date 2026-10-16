@@ -3,6 +3,7 @@ package postgres_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -388,16 +389,15 @@ func TestReserveConcurrentLastUnits(t *testing.T) {
 			})
 			mu.Lock()
 			defer mu.Unlock()
-			switch {
-			case err == nil:
+			if err == nil {
 				succeeded++
-			default:
-				if _, isRejected := domain.AsReservationRejected(err); isRejected {
-					rejected++
-					return
-				}
-				other = append(other, err)
+				return
 			}
+			if _, isRejected := domain.AsReservationRejected(err); isRejected {
+				rejected++
+				return
+			}
+			other = append(other, err)
 		}()
 	}
 	close(begin)
@@ -775,5 +775,235 @@ func TestServiceOverRealStorage(t *testing.T) {
 	}
 	if page.Total != 3 {
 		t.Fatalf("total = %d, want 3", page.Total)
+	}
+}
+
+// assertJournalReconciles checks INV-S9 on one card: every journal entry must
+// continue exactly where the previous one ended, and the newest one must match
+// the card. A delta computed from a stale read breaks the chain.
+func assertJournalReconciles(t *testing.T, r repos, menuItemID uuid.UUID) {
+	t.Helper()
+	ctx := testCtx(t)
+	card, err := r.stock.Get(ctx, merchantID, menuItemID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	movements, total, err := r.stock.ListMovements(ctx, merchantID, menuItemID, 10000, 0)
+	if err != nil {
+		t.Fatalf("ListMovements: %v", err)
+	}
+	if total == 0 || total != len(movements) {
+		t.Fatalf("journal = %d entries of %d", len(movements), total)
+	}
+	// Newest first: each entry continues the one below it.
+	for i := len(movements) - 1; i > 0; i-- {
+		prev, next := movements[i], movements[i-1]
+		if next.OnHandAfter != prev.OnHandAfter+next.DeltaOnHand ||
+			next.ReservedAfter != prev.ReservedAfter+next.DeltaReserved {
+			t.Fatalf("journal entry %d (%s %+d/%+d) does not continue %d/%d: it ends at %d/%d",
+				next.ID, next.Kind, next.DeltaOnHand, next.DeltaReserved,
+				prev.OnHandAfter, prev.ReservedAfter, next.OnHandAfter, next.ReservedAfter)
+		}
+	}
+	if movements[0].OnHandAfter != card.OnHandQty || movements[0].ReservedAfter != card.ReservedQty {
+		t.Fatalf("journal ends at %d/%d, card is %d/%d", movements[0].OnHandAfter,
+			movements[0].ReservedAfter, card.OnHandQty, card.ReservedQty)
+	}
+}
+
+// Concurrent relative changes must all apply: each one is computed from the
+// card it updates, never from a value read before a concurrent change.
+func TestAdjustOnHandConcurrentDeltasAreAllApplied(t *testing.T) {
+	r := newRepos(t)
+	ctx := testCtx(t)
+
+	const workers = 24
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	begin := make(chan struct{})
+	for i := range workers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-begin
+			_, _, err := r.stock.AdjustOnHand(ctx, merchantID, itemSellable, 1,
+				fmt.Sprintf("delivery-%d", i), "delivery")
+			errs <- err
+		}(i)
+	}
+	close(begin)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("AdjustOnHand: %v", err)
+		}
+	}
+
+	item, err := r.stock.Get(ctx, merchantID, itemSellable)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if item.OnHandQty != 10+workers {
+		t.Fatalf("on hand = %d, want %d: concurrent adjustments were lost", item.OnHandQty, 10+workers)
+	}
+	assertJournalReconciles(t, r, itemSellable)
+}
+
+// A merchant write racing the consumption of a confirmed order must neither
+// bring the consumed units back nor leave a journal that does not add up.
+func TestMerchantWritesDoNotUndoAConcurrentCommit(t *testing.T) {
+	r := newRepos(t)
+	ctx := testCtx(t)
+
+	for round := range 20 {
+		if _, err := r.stock.SetOnHand(ctx, merchantID, itemSellable, 50, nil, "setup"); err != nil {
+			t.Fatalf("SetOnHand: %v", err)
+		}
+		orderID := uuid.New()
+		if _, err := r.reservations.Reserve(ctx, domain.ReserveRequest{
+			ReservationID: orderID, MerchantID: merchantID,
+			Lines: []domain.ReserveLine{{MenuItemID: itemSellable, Qty: 5}}, TTL: time.Hour,
+		}); err != nil {
+			t.Fatalf("Reserve: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		errs := make(chan error, 2)
+		begin := make(chan struct{})
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-begin
+			_, err := r.reservations.Commit(ctx, orderID)
+			errs <- err
+		}()
+		go func() {
+			defer wg.Done()
+			<-begin
+			_, _, err := r.stock.AdjustOnHand(ctx, merchantID, itemSellable, 1,
+				fmt.Sprintf("race-%d", round), "delivery")
+			errs <- err
+		}()
+		close(begin)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("round %d: %v", round, err)
+			}
+		}
+
+		item, err := r.stock.Get(ctx, merchantID, itemSellable)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if item.OnHandQty != 50-5+1 || item.ReservedQty != 0 {
+			t.Fatalf("round %d: card = %d on hand / %d held, want 46 / 0",
+				round, item.OnHandQty, item.ReservedQty)
+		}
+	}
+	assertJournalReconciles(t, r, itemSellable)
+}
+
+// An absolute write racing a commit may land before or after it, but its
+// journal entry must record the change it actually made.
+func TestSetOnHandJournalStaysExactUnderAConcurrentCommit(t *testing.T) {
+	r := newRepos(t)
+	ctx := testCtx(t)
+
+	for round := range 20 {
+		orderID := uuid.New()
+		if _, err := r.reservations.Reserve(ctx, domain.ReserveRequest{
+			ReservationID: orderID, MerchantID: merchantID,
+			Lines: []domain.ReserveLine{{MenuItemID: itemSellable, Qty: 2}}, TTL: time.Hour,
+		}); err != nil {
+			t.Fatalf("round %d: Reserve: %v", round, err)
+		}
+
+		var wg sync.WaitGroup
+		errs := make(chan error, 2)
+		begin := make(chan struct{})
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-begin
+			_, err := r.reservations.Commit(ctx, orderID)
+			errs <- err
+		}()
+		go func() {
+			defer wg.Done()
+			<-begin
+			_, err := r.stock.SetOnHand(ctx, merchantID, itemSellable, 10, nil, "stocktake")
+			errs <- err
+		}()
+		close(begin)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("round %d: %v", round, err)
+			}
+		}
+	}
+	assertJournalReconciles(t, r, itemSellable)
+}
+
+// A rejected hold must not blame the lines it managed to hold before the
+// failing one: they are rolled back and can be ordered.
+func TestReserveRejectionCountsBackTheHeldLines(t *testing.T) {
+	r := newRepos(t)
+	ctx := testCtx(t)
+
+	_, err := r.reservations.Reserve(ctx, domain.ReserveRequest{
+		ReservationID: uuid.New(), MerchantID: merchantID,
+		Lines: domain.NormalizeLines([]domain.ReserveLine{
+			{MenuItemID: itemSellable, Qty: 6},
+			{MenuItemID: itemStopped, Qty: 1},
+		}), TTL: time.Hour,
+	})
+	rejected, ok := domain.AsReservationRejected(err)
+	if !ok {
+		t.Fatalf("Reserve = %v, want a rejection", err)
+	}
+	byItem := map[uuid.UUID]domain.LineResult{}
+	for _, l := range rejected.Lines {
+		byItem[l.MenuItemID] = l
+	}
+	if got := byItem[itemSellable]; got.Problem != domain.LineProblemNone || got.AvailableQty != 10 {
+		t.Fatalf("held line reported as %+v, want NONE with 10 available", got)
+	}
+	if got := byItem[itemStopped]; got.Problem != domain.LineProblemSalesStopped {
+		t.Fatalf("stopped line reported as %+v, want SALES_STOPPED", got)
+	}
+	item, err := r.stock.Get(ctx, merchantID, itemSellable)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if item.ReservedQty != 0 {
+		t.Fatalf("a rejected hold kept %d units", item.ReservedQty)
+	}
+}
+
+// A page past the end has no rows, yet the client still needs the total to
+// page back.
+func TestListsPastTheEndKeepTheTotal(t *testing.T) {
+	r := newRepos(t)
+	ctx := testCtx(t)
+
+	items, total, err := r.stock.List(ctx, merchantID, 10, 100)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(items) != 0 || total != 3 {
+		t.Fatalf("stock past the end = %d items, total %d; want 0 and 3", len(items), total)
+	}
+
+	movements, total, err := r.stock.ListMovements(ctx, merchantID, itemSellable, 10, 100)
+	if err != nil {
+		t.Fatalf("ListMovements: %v", err)
+	}
+	if len(movements) != 0 || total != 1 {
+		t.Fatalf("journal past the end = %d entries, total %d; want 0 and 1", len(movements), total)
 	}
 }

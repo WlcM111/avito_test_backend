@@ -102,7 +102,7 @@ mkdirs \
   deploy/postgres/init \
   docs/cjm docs/c4 \
   scripts \
-  test/testenv test/e2e test/load/k6
+  test/testenv test/e2e
 
 # ---------------------------------------------------------------- repo root
 touch_file README.md
@@ -194,9 +194,8 @@ touch_file internal/inventory/domain/errors.go             domain
 touch_file internal/inventory/domain/stock_item_test.go    domain_test
 touch_file internal/inventory/domain/reservation_test.go   domain_test
 touch_file internal/inventory/app/ports.go                 app
-touch_file internal/inventory/app/stock_commands.go        app
-touch_file internal/inventory/app/reservation_commands.go  app
-touch_file internal/inventory/app/availability_queries.go  app
+touch_file internal/inventory/app/errors.go                app
+touch_file internal/inventory/app/service.go               app
 touch_file internal/inventory/app/service_test.go          app_test
 touch_file internal/inventory/config/config.go             config
 touch_file internal/inventory/adapters/httpapi/router.go   httpapi
@@ -321,8 +320,6 @@ touch_file scripts/smoke-pos.sh
 # -------------------------------------------------------------------- tests
 touch_file test/testenv/postgres.go        testenv
 touch_file test/e2e/journey_test.go        e2e_test
-touch_file test/load/k6/mixed.js
-touch_file test/load/README.md
 
 chmod +x scripts/create-structure.sh scripts/smoke.sh scripts/smoke-inventory.sh \
         scripts/smoke-catalog.sh scripts/smoke-order.sh scripts/smoke-pos.sh \

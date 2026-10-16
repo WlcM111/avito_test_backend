@@ -49,7 +49,9 @@ func Serve(ctx context.Context, srv *http.Server, logger *slog.Logger, grace tim
 	case <-ctx.Done():
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), grace)
+	// The shutdown keeps the values of ctx but not its cancellation: ctx is
+	// already done, and the grace period must still run in full.
+	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), grace)
 	defer cancel()
 	logger.Info("http listener stopping", slog.String("addr", srv.Addr))
 	if err := srv.Shutdown(shutdownCtx); err != nil {

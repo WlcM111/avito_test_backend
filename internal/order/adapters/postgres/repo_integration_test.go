@@ -283,6 +283,24 @@ func TestListsAreScopedOrderedAndPaginated(t *testing.T) {
 	if filtered.Total != 0 {
 		t.Fatalf("no order is confirmed yet, got %d", filtered.Total)
 	}
+
+	// A page past the end has no rows, yet both lists must still report the
+	// total, with the status filter applied.
+	pastHistory, err := e.orders.ListByCustomer(ctx, customerID, 2, 10)
+	if err != nil {
+		t.Fatalf("ListByCustomer(past the end) = %v", err)
+	}
+	if len(pastHistory.Items) != 0 || pastHistory.Total != 3 {
+		t.Fatalf("history past the end = %+v, want no items and total 3", pastHistory)
+	}
+	pastQueue, err := e.orders.ListByMerchant(ctx, merchantID,
+		[]domain.Status{domain.StatusCreated}, 2, 10)
+	if err != nil {
+		t.Fatalf("ListByMerchant(past the end) = %v", err)
+	}
+	if len(pastQueue.Items) != 0 || pastQueue.Total != 3 {
+		t.Fatalf("queue past the end = %+v, want no items and total 3", pastQueue)
+	}
 }
 
 // The status change and the outbox message are one transaction: a decision

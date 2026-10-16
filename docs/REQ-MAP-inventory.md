@@ -9,7 +9,7 @@
 
 | ID | Источник | Требуемое поведение | Состояние до итерации | Сделано | Проверка | Статус |
 |---|---|---|---|---|---|---|
-| R-01 | ТЗ §5.1 | Учётный объект — карточка `(merchant_id, menu_item_id)`; штуки однородны, не идентифицируются | отсутствовало | `domain.StockItem`, UNIQUE (`merchant_id`,`menu_item_id`) | `TestStockItem*`, `IT: TestSetOnHandCreatesCard` | выполнено |
+| R-01 | ТЗ §5.1 | Учётный объект — карточка `(merchant_id, menu_item_id)`; штуки однородны, не идентифицируются | отсутствовало | `domain.StockItem`, UNIQUE (`merchant_id`,`menu_item_id`) | `TestAvailableQty`, `TestSellableRequiresBothDimensions`, `IT: TestSetOnHandCreatesCardAndRecordsMovement` | выполнено |
 | R-02 | ТЗ §5.2 | Величины `on_hand_qty`, `reserved_qty`, вычисляемое `available_qty`, `version` | отсутствовало | поля `stock_items`, `StockItem.AvailableQty()` | `TestAvailableQty` | выполнено |
 | R-03 | ТЗ §5.3 | `sales_state` ∈ {ENABLED, STOPPED}, независимое от количеств измерение | отсутствовало | `domain.SalesState`, CHECK в схеме | `TestSalesStateValid` | выполнено |
 | R-04 | ТЗ §5.3, INV-S8 | Перевод в `ENABLED`/`STOPPED` не изменяет количеств; карточка создаётся с `on_hand_qty = 0` | отсутствовало | отдельный `UPDATE` без колонок количеств | `TestSetSalesStateDoesNotTouchQuantities` (unit + IT) | выполнено |
@@ -28,29 +28,31 @@
 
 | ID | Требование (ТЗ §5.5) | Механизм | Проверка | Статус |
 |---|---|---|---|---|
-| INV-S1 | `on_hand_qty ≥ 0` | `CHECK stock_items_on_hand_chk` | `IT: TestCheckConstraints` | выполнено |
-| INV-S2 | `reserved_qty ≥ 0` | `CHECK stock_items_reserved_chk` | `IT: TestCheckConstraints` | выполнено |
-| INV-S3 | `reserved_qty ≤ on_hand_qty` | `CHECK stock_items_reserved_le_on_hand_chk` | `IT: TestCheckConstraints`, `TestSetOnHandBelowReserved` | выполнено |
-| INV-S4 | Резерв только если по каждой строке `ENABLED` и `available_qty ≥ qty` | условный `UPDATE`, 0 строк ⇒ откат всей транзакции | `IT: TestReserveAllOrNothing`, `TestReserveConcurrentLastUnit` | выполнено |
+| INV-S1 | `on_hand_qty ≥ 0` | `CHECK stock_items_on_hand_chk` | `IT: TestCheckConstraintsProtectInvariants` | выполнено |
+| INV-S2 | `reserved_qty ≥ 0` | `CHECK stock_items_reserved_chk` | `IT: TestCheckConstraintsProtectInvariants` | выполнено |
+| INV-S3 | `reserved_qty ≤ on_hand_qty` | `CHECK stock_items_reserved_le_on_hand_chk` | `IT: TestCheckConstraintsProtectInvariants`, `TestSetOnHandVersionConflictAndBelowReserved` | выполнено |
+| INV-S4 | Резерв только если по каждой строке `ENABLED` и `available_qty ≥ qty` | условный `UPDATE`, 0 строк ⇒ откат всей транзакции | `TestReserveIsAllOrNothing`, `IT: TestReserveHoldsAndReportsProblems`, `IT: TestReserveConcurrentLastUnits` | выполнено |
 | INV-S5 | Резерв ровно один раз переходит в терминальное состояние | `UPDATE ... WHERE id=$1 AND state='HELD'` | `IT: TestCommitReleaseRace` | выполнено |
 | INV-S6 | Один `reservation_id` — одно удержание | PK `stock_reservations` + `ON CONFLICT DO NOTHING` | `IT: TestReserveIsIdempotent` | выполнено |
 | INV-S7 | Один `operation_key` применяется один раз | PK (`stock_item_id`,`operation_key`) | `IT: TestAdjustOnHandIsDeduplicated` | выполнено |
 | INV-S8 | `SetSalesState` не изменяет количеств | отдельный `UPDATE` | unit + `IT` | выполнено |
-| INV-S9 | Каждое изменение количеств отражено в журнале | вставка `stock_movements` в той же транзакции | `IT: TestMovementsRecorded*` | выполнено |
-| INV-S10 | `qty > 0` в строке резерва | `CHECK stock_reservation_lines_qty_chk` | `IT: TestCheckConstraints` | выполнено |
+| INV-S9 | Каждое изменение количеств отражено в журнале | вставка `stock_movements` в той же транзакции | `IT: TestSetOnHandCreatesCardAndRecordsMovement`, `IT: TestSetOnHandJournalStaysExactUnderAConcurrentCommit` | выполнено |
+| INV-S10 | `qty > 0` в строке резерва | `CHECK stock_reservation_lines_qty_chk` | `IT: TestCheckConstraintsProtectInvariants` | выполнено |
 
 ## Конкурентность и повторы (ТЗ §5.6)
 
 | Ситуация | Реализация | Проверка | Статус |
 |---|---|---|---|
-| Двое резервируют последнюю штуку | условный `UPDATE`, отказ `INSUFFICIENT_UNITS` с фактическим `available_qty` | `TestReserveConcurrentLastUnit` (16 горутин) | выполнено |
+| Двое резервируют последнюю штуку | условный `UPDATE`, отказ `INSUFFICIENT_UNITS` с фактическим `available_qty` | `TestReserveConcurrentLastUnits` (16 горутин) | выполнено |
 | Многопозиционный заказ, deadlock | строки захватываются в порядке возрастания `menu_item_id` | `TestReserveNoDeadlockOnOppositeOrder` | выполнено |
 | Повтор `Reserve` | количества не удерживаются повторно, `already_existed = true` | `TestReserveIsIdempotent` | выполнено |
 | Одновременные `Commit` и `Release` | ровно один проходит, второй — `FAILED_PRECONDITION` | `TestCommitReleaseRace` | выполнено |
-| Повтор `Commit` | `already_committed = true`, успех | `TestCommitIsIdempotent` | выполнено |
-| Повтор `AdjustOnHand` | прежний результат, остаток меняется один раз | `TestAdjustOnHandIsDeduplicated` | выполнено |
-| `on_hand_qty` ниже `reserved_qty` | 409 `BELOW_RESERVED`, без клампинга | `TestSetOnHandBelowReserved` | выполнено |
-| `STOPPED` при активных резервах | разрешено, удержанное остаётся | `TestStopWithActiveReservation` | выполнено |
+| Повтор `Commit` | `already_committed = true`, успех | `TestCommitAndReleaseAreIdempotent` | выполнено |
+| Повтор `AdjustOnHand` | ничего не меняет, возвращает текущую карточку с `duplicate = true`; остаток меняется один раз | `TestAdjustOnHandIsDeduplicated` | выполнено |
+| Корректировка или установка одновременно со списанием или другой корректировкой | карточка блокируется `SELECT … FOR UPDATE`, новое значение вычисляется из заблокированной строки (аудит, `docs/PROJECT-STATE.md` §2) | `IT: TestAdjustOnHandConcurrentDeltasAreAllApplied`, `IT: TestMerchantWritesDoNotUndoAConcurrentCommit`, `IT: TestSetOnHandJournalStaysExactUnderAConcurrentCommit` | выполнено |
+| Отказ резерва при удержанных ранее строках той же транзакции | удержанные строки возвращаются в расчёт доступности и не помечаются нехваткой | `IT: TestReserveRejectionCountsBackTheHeldLines` | выполнено |
+| `on_hand_qty` ниже `reserved_qty` | 409 `BELOW_RESERVED`, без клампинга | `TestSetOnHandVersionConflictAndBelowReserved` | выполнено |
+| `STOPPED` при активных резервах | разрешено, удержанное остаётся | `TestSetSalesStateDoesNotTouchQuantities` | выполнено |
 | Гонка sweeper и `Commit` | оба по условию `state='HELD'`, выигрывает первый | `TestSweeperCommitRace` | выполнено |
 
 ## Нефункциональные требования

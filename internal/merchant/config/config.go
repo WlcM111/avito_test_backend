@@ -4,6 +4,7 @@
 package config
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/avito-kitchen/platform/pkg/envcfg"
@@ -86,6 +87,11 @@ func Load() (Config, error) {
 	}
 	if err := l.Err(); err != nil {
 		return Config{}, err
+	}
+	if cfg.DBMinConns > cfg.DBMaxConns {
+		return Config{}, fmt.Errorf(
+			"invalid configuration: DB_MIN_CONNS (%d) must not exceed DB_MAX_CONNS (%d)",
+			cfg.DBMinConns, cfg.DBMaxConns)
 	}
 	return cfg, nil
 }

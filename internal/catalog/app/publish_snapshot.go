@@ -46,6 +46,7 @@ func (s *Service) UpdateMenuItem(ctx context.Context, merchantID, itemID uuid.UU
 		ve.Add("item_id", "is required")
 		return UpdateItemResult{}, ve
 	}
+	patch = patch.Normalize()
 	if err := patch.Validate(); err != nil {
 		return UpdateItemResult{}, err
 	}

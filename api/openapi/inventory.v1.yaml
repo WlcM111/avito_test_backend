@@ -159,8 +159,9 @@ paths:
       summary: Apply a relative change to the units on hand
       description: |
         A relative change is not idempotent by nature, so operation_key is
-        required: repeating a request with the same key returns the stored
-        result and applies the delta once.
+        required: the delta is applied once per key. Repeating a request with
+        the same key changes nothing and returns the current card with
+        duplicate set to true.
       security: [{ apiKey: [] }]
       parameters:
         - { name: menu_item_id, in: path, required: true, schema: { type: string, format: uuid } }

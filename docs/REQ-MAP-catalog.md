@@ -28,10 +28,10 @@ gRPC поверх `bufconn`, `HT` — тест HTTP-адаптера через 
 | A-10 | Связать данные системы с данными заведений и пользователями | `menu_items.external_id` — идентификатор позиции в системе заведения; `merchant_id` — владелец | UNIQUE (`merchant_id`, `external_id`) | `IT: TestRepublishKeepsIdentityAndWithdrawsAbsentItems`, `SC` | выполнено |
 | A-11 | Язык — Go | Go 1.24, без новых зависимостей | `go.mod` не изменён | `SC` | выполнено |
 | A-12 | БД на выбор | PostgreSQL 18, отдельная логическая база `catalog` | `deploy/postgres/init/01-databases.sql` | `SC` | выполнено |
-| A-13 | Запуск через Docker Compose | Блоки `catalog-migrate` и `catalog-service` | `docker-compose.yml`, `deploy/catalog-service.Dockerfile` | `SC`; фактический `docker compose up` — не подтверждено (в окружении нет Docker) | не подтверждено |
-| A-14 | Линтер и статический анализ | Правила границ для нового сервиса | `.golangci.yml`: `app-purity`, `service-isolation-catalog` | `SC`; `golangci-lint` — не подтверждено (бинарь недоступен) | не подтверждено |
+| A-13 | Запуск через Docker Compose | Блоки `catalog-migrate` и `catalog-service` | `docker-compose.yml`, `deploy/catalog-service.Dockerfile` | `make stack-check` (`docker compose up --build -d`, `make wait smoke e2e`), CI job `e2e` | выполнено |
+| A-14 | Линтер и статический анализ | Правила границ для нового сервиса | `.golangci.yml`: `app-purity`, `service-isolation-catalog` | `make lint` (golangci-lint v2.5.0 и v2.14.0): 0 замечаний; CI job `lint` | выполнено |
 | A-15 | Кодогенерация для API | Контракт `catalog.v1` уже сгенерирован в итерации 1; реализация ему соответствует | `gen/grpc/catalog/v1/*.pb.go` не изменялись | `SC`: все используемые символы найдены в сгенерированном коде | выполнено |
-| A-17 | Приложение поднимается и выполняет бизнес-сценарии | Точка входа, конфигурация, завершение | `cmd/catalog-service/main.go` | `SC`; фактический запуск — не подтверждено (нет Go-тулчейна) | не подтверждено |
+| A-17 | Приложение поднимается и выполняет бизнес-сценарии | Точка входа, конфигурация, завершение | `cmd/catalog-service/main.go` | smoke, `E2E` (`make e2e`) против запущенного стека | выполнено |
 | A-19…A-21 | README: описание, архитектура, схема БД | Разделы «Внешний API catalog-service» и «Схема БД catalog» | `README.md` | `SC` | выполнено |
 | A-22, A-23 | Упрощения и подход к решениям | Шесть новых строк в таблице решений README | `README.md` | `SC` | выполнено |
 | A-05, A-06, A-16, A-18 | CJM, partner-pos, промпт, диаграммы | Относятся к системе целиком и к другим итерациям | — | — | н/п |
@@ -59,7 +59,7 @@ gRPC поверх `bufconn`, `HT` — тест HTTP-адаптера через 
 | C-17 | §11.1 | Никакого состояния в памяти процесса; идентификаторы генерирует приложение; индексы под фактические запросы; тайм-ауты и `context` по всей цепочке | общее правило | `uuid.New()` в репозитории, тайм-аут вызова merchant, `context` во всех портах | `SC`, `UT` | выполнено |
 | C-18 | §14.3 | Совместимость: имена gRPC-пакета и методов, модуль, адреса Compose, имена БД и ролей, конверт ошибок из `pkg/httpx` | зафиксировано | ничего из перечисленного не изменено | `SC`: diff общих файлов | выполнено |
 | C-19 | §2.3 п. 4 | Миграции применяются с нуля и повторно без изменения состояния | механизм готов | `migrations/catalog` + `pgmigrate` | `IT: TestMigrationsAreIdempotent` | выполнено |
-| C-20 | §2.3 п. 6 | `go build`, `go vet`, `gofmt`, `go test -race` без замечаний | — | код написан под эти проверки | **не подтверждено**: в окружении нет Go-тулчейна и сети | не подтверждено |
+| C-20 | §2.3 п. 6 | `go build`, `go vet`, `gofmt`, `go test -race` без замечаний | — | код написан под эти проверки | `make check`: без замечаний (`docs/PROJECT-STATE.md` §5) | выполнено |
 
 ## Инварианты каталога
 

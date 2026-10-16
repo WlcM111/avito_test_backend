@@ -828,3 +828,103 @@ func TestAuthenticate(t *testing.T) {
 		t.Fatalf("an outage must not be reported as a bad key, got %v", err)
 	}
 }
+
+// ------------------------------------------------- holds of unstored orders
+
+// unstoredOrders makes the write of the order fail or lose a race, which is
+// what the release of an orphan hold exists for.
+type unstoredOrders struct {
+	*testsupport.Orders
+	createErr error
+	// competitor, when set, is stored under the same idempotency key right
+	// before our write: the concurrent submit that won.
+	competitor *domain.Order
+}
+
+func (u *unstoredOrders) Create(ctx context.Context, order domain.Order) (domain.Order, bool, error) {
+	if u.createErr != nil {
+		return domain.Order{}, false, u.createErr
+	}
+	if u.competitor != nil {
+		winner := *u.competitor
+		winner.IdempotencyKey = order.IdempotencyKey
+		if _, _, err := u.Orders.Create(ctx, winner); err != nil {
+			return domain.Order{}, false, err
+		}
+	}
+	return u.Orders.Create(ctx, order)
+}
+
+func newEnvWith(t *testing.T, orders app.OrderRepository) env {
+	t.Helper()
+	e := newEnv(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	e.svc = app.NewService(orders, e.orders, e.directory, e.catalogue, e.ledger, logger, app.Config{
+		ReservationTTL: 30 * time.Minute, MaxDeliveryAttempts: 3,
+	})
+	return e
+}
+
+// The order was not written, so its hold is returned at once instead of
+// waiting for the TTL.
+func TestCreateOrderReleasesTheHoldWhenTheOrderIsNotStored(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	storeDown := errors.New("database is down")
+	e = newEnvWith(t, &unstoredOrders{Orders: e.orders, createErr: storeDown})
+
+	_, err := e.svc.CreateOrder(context.Background(), draft(line(testsupport.ItemSellable, 2)), "key-1")
+	if !errors.Is(err, storeDown) {
+		t.Fatalf("CreateOrder() = %v, want the storage error", err)
+	}
+	if e.ledger.Releases() != 1 {
+		t.Fatalf("releases = %d, want the orphan hold returned once", e.ledger.Releases())
+	}
+	if _, reserved, _ := e.ledger.Snapshot(testsupport.ItemSellable); reserved != 0 {
+		t.Fatalf("reserved = %d, want 0", reserved)
+	}
+}
+
+// Two submits of one key raced and the other one won: ours returns the
+// winner and gives back the units it held for an order that will never exist.
+func TestCreateOrderLosingTheKeyRaceReturnsTheWinnerAndItsHold(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	winner := domain.Order{
+		ID: uuid.New(), MerchantID: testsupport.MerchantID, CustomerID: testsupport.CustomerID,
+		Status: domain.StatusCreated, Currency: domain.Currency,
+	}
+	e = newEnvWith(t, &unstoredOrders{Orders: e.orders, competitor: &winner})
+
+	result, err := e.svc.CreateOrder(context.Background(), draft(line(testsupport.ItemSellable, 2)), "key-1")
+	if err != nil {
+		t.Fatalf("CreateOrder() = %v", err)
+	}
+	if !result.Duplicate || result.Order.ID != winner.ID {
+		t.Fatalf("result = %+v, want the winner reported as a duplicate", result)
+	}
+	if e.ledger.Releases() != 1 {
+		t.Fatalf("releases = %d, want our hold returned", e.ledger.Releases())
+	}
+	if _, reserved, _ := e.ledger.Snapshot(testsupport.ItemSellable); reserved != 0 {
+		t.Fatalf("reserved = %d, want 0", reserved)
+	}
+}
+
+// Returning the hold is best effort: when it fails the TTL remains the
+// guarantee, and the caller still learns why the placement failed.
+func TestCreateOrderLeavesAnUnreturnedHoldToTheTTL(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	storeDown := errors.New("database is down")
+	e = newEnvWith(t, &unstoredOrders{Orders: e.orders, createErr: storeDown})
+	e.ledger.SetReleaseErr(app.Unavailable("inventory-service", errors.New("connection refused")))
+
+	_, err := e.svc.CreateOrder(context.Background(), draft(line(testsupport.ItemSellable, 2)), "key-1")
+	if !errors.Is(err, storeDown) {
+		t.Fatalf("CreateOrder() = %v, want the storage error, not the release error", err)
+	}
+	if _, reserved, _ := e.ledger.Snapshot(testsupport.ItemSellable); reserved != 2 {
+		t.Fatalf("reserved = %d, want the hold left for the sweeper", reserved)
+	}
+}
